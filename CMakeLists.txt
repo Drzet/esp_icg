@@ -11,3 +11,13 @@ idf_build_set_property(ESP_IPA_JSON_CONFIG_FILE_PATH "${imx708_ipa_json}" APPEND
 idf_build_set_property(IMX708_IPA_JSON_RESOLVED "${imx708_ipa_json}")
 
 project(esp_icg)
+
+# claw_video 2.4.0~1 is published with an esp_ipa 2.2.* dependency, but its
+# archive includes two optional AGC-status wrappers that reference the later
+# esp_ipa 2.3 ioctl API. The application does not use those wrappers; force a
+# tiny compatibility shim only for claw_video so the rest of the 2.2 ABI stays
+# untouched.
+idf_component_get_property(claw_video_lib claw_video COMPONENT_LIB)
+target_compile_options(${claw_video_lib} PRIVATE
+    "-include${CMAKE_SOURCE_DIR}/config/esp_ipa_22_compat.h"
+)
