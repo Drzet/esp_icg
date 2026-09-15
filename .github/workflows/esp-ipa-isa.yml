@@ -47,3 +47,28 @@ jobs:
           inspect_one ipa_2_2_0 4a707c985706f49f9ef17a8d0d38d058846dae40
           inspect_one ipa_2_3_0 b66c33ba75ff233da3dfaf4456158fdff8649b99
           inspect_one ipa_current c132be656b3159a6e06db70aaa850885c6680435
+
+      - name: Link current project against esp_ipa 2.2 binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          source /opt/esp/idf/export.sh
+          sed -i 's/CONFIG_ESP_VIDEO_ENABLE_ISP_PIPELINE_CONTROLLER=n/CONFIG_ESP_VIDEO_ENABLE_ISP_PIPELINE_CONTROLLER=y/' sdkconfig.defaults
+          rm -rf build sdkconfig managed_components dependencies.lock
+          idf.py set-target esp32p4
+
+          IPA_LIB="managed_components/espressif__esp_ipa/lib/esp32p4/v6.0+/libesp_ipa.a"
+          curl -fL "https://raw.githubusercontent.com/espressif/esp-video-components/4a707c985706f49f9ef17a8d0d38d058846dae40/esp_ipa/lib/esp32p4/v6.0+/libesp_ipa.a" -o "$IPA_LIB"
+          echo "Substituted esp_ipa 2.2 archive:"
+          sha256sum "$IPA_LIB"
+
+          idf.py build
+          echo "Compatibility build succeeded"
+          riscv32-esp-elf-objdump -d build/esp_icg.elf > /tmp/firmware.S
+          echo "Firmware Zba counts:"
+          for op in sh1add sh2add sh3add; do
+            printf '%s=' "$op"
+            grep -Ec "[[:space:]]${op}[[:space:]]" /tmp/firmware.S || true
+          done
+          echo "Linked esp_ipa_pipeline_create excerpt:"
+          grep -n -A50 -B5 '<esp_ipa_pipeline_create>:' /tmp/firmware.S | head -n 70 || true
