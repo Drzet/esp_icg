@@ -29,6 +29,16 @@
 #define PPA_CACHE_LINE_SIZE    128
 #define PREVIEW_BUFFER_SIZE    (ICG_LCD_WIDTH * ICG_PREVIEW_HEIGHT * sizeof(uint16_t))
 
+/*
+ * ESP32-P4 PPA scale factors are quantized to 1/16 steps. 1920x1080 ->
+ * 480x280 cannot therefore use the naive ~0.259 scale: it is truncated to
+ * 0.25, producing a smaller block and leaving stale strips at the right and
+ * bottom. A centered 1536x896 crop scales exactly by 5/16 to 480x280.
+ */
+#define PREVIEW_CROP_WIDTH     1536
+#define PREVIEW_CROP_HEIGHT    896
+#define PREVIEW_SCALE          (5.0f / 16.0f)
+
 static const char *TAG = "imx708_preview";
 static ppa_client_handle_t s_ppa;
 static uint16_t *s_preview;
@@ -72,27 +82,22 @@ static esp_err_t preview_frame(const uint8_t *frame, uint32_t width, uint32_t he
     if (!frame || len < (size_t)width * height * sizeof(uint16_t)) {
         return ESP_ERR_INVALID_SIZE;
     }
-
-    uint32_t crop_w = width;
-    uint32_t crop_h = height;
-
-    if ((uint64_t)width * ICG_PREVIEW_HEIGHT > (uint64_t)height * ICG_LCD_WIDTH) {
-        crop_w = (uint32_t)((uint64_t)height * ICG_LCD_WIDTH / ICG_PREVIEW_HEIGHT);
-        crop_w &= ~1U;
-    } else {
-        crop_h = (uint32_t)((uint64_t)width * ICG_PREVIEW_HEIGHT / ICG_LCD_WIDTH);
-        crop_h &= ~1U;
+    if (width < PREVIEW_CROP_WIDTH || height < PREVIEW_CROP_HEIGHT) {
+        return ESP_ERR_INVALID_SIZE;
     }
+
+    const uint32_t crop_x = (width - PREVIEW_CROP_WIDTH) / 2;
+    const uint32_t crop_y = (height - PREVIEW_CROP_HEIGHT) / 2;
 
     ppa_srm_oper_config_t op = {
         .in = {
             .buffer = (void *)frame,
             .pic_w = width,
             .pic_h = height,
-            .block_w = crop_w,
-            .block_h = crop_h,
-            .block_offset_x = (width - crop_w) / 2,
-            .block_offset_y = (height - crop_h) / 2,
+            .block_w = PREVIEW_CROP_WIDTH,
+            .block_h = PREVIEW_CROP_HEIGHT,
+            .block_offset_x = crop_x,
+            .block_offset_y = crop_y,
             .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
         },
         .out = {
@@ -105,9 +110,10 @@ static esp_err_t preview_frame(const uint8_t *frame, uint32_t width, uint32_t he
             .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
         },
         .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
-        .scale_x = (float)ICG_LCD_WIDTH / (float)crop_w,
-        .scale_y = (float)ICG_PREVIEW_HEIGHT / (float)crop_h,
-        .mirror_x = true,
+        .scale_x = PREVIEW_SCALE,
+        .scale_y = PREVIEW_SCALE,
+        .mirror_x = false,
+        .mirror_y = true,
         .mode = PPA_TRANS_MODE_BLOCKING,
     };
 
@@ -176,7 +182,8 @@ static esp_err_t run_preview(int fd)
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "live preview started");
+    ESP_LOGI(TAG, "live preview started: crop=%dx%d scale=5/16",
+             PREVIEW_CROP_WIDTH, PREVIEW_CROP_HEIGHT);
     uint32_t frames = 0;
 
     while (true) {
