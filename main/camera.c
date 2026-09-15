@@ -92,6 +92,7 @@ static void render_frame(uint8_t *buf, uint32_t width, uint32_t height, size_t l
         .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
         .scale_x = (float)ICG_LCD_WIDTH / (float)crop_w,
         .scale_y = (float)ICG_PREVIEW_HEIGHT / (float)crop_h,
+        .mirror_x = true,
         .mode = PPA_TRANS_MODE_BLOCKING,
     };
 
