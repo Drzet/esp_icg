@@ -112,7 +112,7 @@ static esp_err_t preview_frame(const uint8_t *frame, uint32_t width, uint32_t he
         .rotation_angle = PPA_SRM_ROTATION_ANGLE_180,
         .scale_x = PREVIEW_SCALE,
         .scale_y = PREVIEW_SCALE,
-        .mirror_x = false,
+        .mirror_x = true,
         .mirror_y = false,
         .mode = PPA_TRANS_MODE_BLOCKING,
     };
@@ -182,7 +182,7 @@ static esp_err_t run_preview(int fd)
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "live preview started: crop=%dx%d scale=5/16 rotation=180",
+    ESP_LOGI(TAG, "live preview started: crop=%dx%d scale=5/16 rotation=180 mirror_x=1",
              PREVIEW_CROP_WIDTH, PREVIEW_CROP_HEIGHT);
     uint32_t frames = 0;
 
