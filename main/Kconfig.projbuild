@@ -1,0 +1,38 @@
+menu "ICG prototype"
+
+config ICG_SD_SCLK_GPIO
+    int "SD SCLK GPIO"
+    default -1
+    range -1 55
+
+config ICG_SD_MOSI_GPIO
+    int "SD MOSI GPIO"
+    default -1
+    range -1 55
+
+config ICG_SD_MISO_GPIO
+    int "SD MISO GPIO"
+    default -1
+    range -1 55
+
+config ICG_SD_CS_GPIO
+    int "SD CS GPIO"
+    default -1
+    range -1 55
+
+config ICG_JPEG_QUALITY
+    int "Recording JPEG quality"
+    default 80
+    range 1 100
+
+config ICG_RECORD_MAX_WIDTH
+    int "Maximum record width"
+    default 1280
+    range 320 4096
+
+config ICG_RECORD_MAX_HEIGHT
+    int "Maximum record height"
+    default 960
+    range 240 3072
+
+endmenu
