@@ -1,32 +1,44 @@
 #include "camera.h"
 
+#include <errno.h>
+#include <fcntl.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <unistd.h>
 #include "freertos/FreeRTOS.h"
-#include "freertos/semphr.h"
+#include "freertos/task.h"
+#include "driver/gpio.h"
 #include "driver/ppa.h"
 #include "esp_check.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_video_init.h"
 #include "linux/videodev2.h"
-#include "wt_bsp.h"
 #include "app_config.h"
 #include "display.h"
 #include "recorder.h"
 
+#define CAMERA_DEV "/dev/video0"
+#define CAMERA_WIDTH 800
+#define CAMERA_HEIGHT 640
+#define CAMERA_BUFFERS 3
+#define CAMERA_SCCB_SCL 8
+#define CAMERA_SCCB_SDA 7
+#define CAMERA_POWER_GPIO 0
+
 static const char *TAG = "camera";
-static wt_bsp_csi_t s_csi;
 static ppa_client_handle_t s_ppa;
 static uint16_t *s_preview;
-static SemaphoreHandle_t s_preview_lock;
 static volatile bool s_running;
+static TaskHandle_t s_task;
+static int s_fd = -1;
+static void *s_buffers[CAMERA_BUFFERS];
+static size_t s_buffer_lengths[CAMERA_BUFFERS];
 
-static void camera_frame_cb(uint8_t *buf, uint32_t width, uint32_t height, size_t len, void *user_data)
+static void render_frame(uint8_t *buf, uint32_t width, uint32_t height, size_t len)
 {
-    (void)user_data;
-    if (!buf || !s_preview || !s_ppa || !s_running) return;
-
     recorder_submit_rgb565(buf, width, height, len);
-
-    if (xSemaphoreTake(s_preview_lock, 0) != pdTRUE) return;
 
     uint32_t crop_w = width;
     uint32_t crop_h = height;
@@ -65,50 +77,156 @@ static void camera_frame_cb(uint8_t *buf, uint32_t width, uint32_t height, size_
     esp_err_t ret = ppa_do_scale_rotate_mirror(s_ppa, &op);
     if (ret == ESP_OK) ret = display_draw_preview(s_preview);
     if (ret != ESP_OK) ESP_LOGW(TAG, "preview frame failed: %s", esp_err_to_name(ret));
+}
 
-    xSemaphoreGive(s_preview_lock);
+static void capture_task(void *arg)
+{
+    (void)arg;
+    while (s_running) {
+        struct v4l2_buffer b = {
+            .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+            .memory = V4L2_MEMORY_MMAP,
+        };
+        if (ioctl(s_fd, VIDIOC_DQBUF, &b) != 0) {
+            if (errno == EAGAIN) {
+                vTaskDelay(pdMS_TO_TICKS(2));
+                continue;
+            }
+            ESP_LOGW(TAG, "DQBUF failed: errno=%d", errno);
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+
+        if ((b.flags & V4L2_BUF_FLAG_DONE) && b.index < CAMERA_BUFFERS) {
+            render_frame((uint8_t *)s_buffers[b.index], CAMERA_WIDTH, CAMERA_HEIGHT, b.bytesused);
+        }
+
+        if (ioctl(s_fd, VIDIOC_QBUF, &b) != 0) {
+            ESP_LOGW(TAG, "QBUF failed: errno=%d", errno);
+        }
+    }
+
+    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    ioctl(s_fd, VIDIOC_STREAMOFF, &type);
+    for (int i = 0; i < CAMERA_BUFFERS; ++i) {
+        if (s_buffers[i] && s_buffers[i] != MAP_FAILED) {
+            munmap(s_buffers[i], s_buffer_lengths[i]);
+            s_buffers[i] = NULL;
+        }
+    }
+    close(s_fd);
+    s_fd = -1;
+    s_task = NULL;
+    vTaskDelete(NULL);
 }
 
 esp_err_t camera_init(void)
 {
-    s_csi = wt_bsp_get_csi();
-    if (!s_csi) {
-        ESP_LOGE(TAG, "CSI unavailable; check OV5647 ribbon/orientation and camera configuration");
-        return ESP_ERR_NOT_FOUND;
-    }
+    gpio_config_t pwr = {
+        .pin_bit_mask = 1ULL << CAMERA_POWER_GPIO,
+        .mode = GPIO_MODE_OUTPUT,
+    };
+    ESP_RETURN_ON_ERROR(gpio_config(&pwr), TAG, "camera power gpio");
+    gpio_set_level(CAMERA_POWER_GPIO, 1);
+    vTaskDelay(pdMS_TO_TICKS(100));
 
-    ppa_client_config_t cfg = {
+    esp_video_init_csi_config_t csi = {
+        .sccb_config = {
+            .init_sccb = true,
+            .i2c_config = {
+                .port = 0,
+                .scl_pin = CAMERA_SCCB_SCL,
+                .sda_pin = CAMERA_SCCB_SDA,
+            },
+            .freq = 400000,
+        },
+        .reset_pin = -1,
+        .pwdn_pin = -1,
+        .dont_init_ldo = false,
+    };
+    esp_video_init_config_t video_cfg = {
+        .csi = &csi,
+    };
+    ESP_RETURN_ON_ERROR(esp_video_init_with_flags(&video_cfg,
+                        ESP_VIDEO_INIT_FLAGS_MIPI_CSI | ESP_VIDEO_INIT_FLAGS_ISP), TAG, "esp_video init");
+
+    ppa_client_config_t ppa_cfg = {
         .oper_type = PPA_OPERATION_SRM,
         .max_pending_trans_num = 1,
     };
-    ESP_RETURN_ON_ERROR(ppa_register_client(&cfg, &s_ppa), TAG, "PPA client");
+    ESP_RETURN_ON_ERROR(ppa_register_client(&ppa_cfg, &s_ppa), TAG, "PPA client");
 
     s_preview = heap_caps_malloc(ICG_LCD_WIDTH * ICG_PREVIEW_HEIGHT * sizeof(uint16_t),
                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!s_preview) return ESP_ERR_NO_MEM;
-
-    s_preview_lock = xSemaphoreCreateMutex();
-    if (!s_preview_lock) return ESP_ERR_NO_MEM;
-
-    return wt_bsp_csi_set_pixel_format(s_csi, V4L2_PIX_FMT_RGB565);
+    return s_preview ? ESP_OK : ESP_ERR_NO_MEM;
 }
 
 esp_err_t camera_start(void)
 {
-    if (!s_csi) return ESP_ERR_INVALID_STATE;
     if (s_running) return ESP_OK;
-    esp_err_t ret = wt_bsp_csi_start(s_csi, camera_frame_cb, NULL);
-    if (ret == ESP_OK) s_running = true;
-    return ret;
+
+    s_fd = open(CAMERA_DEV, O_RDONLY | O_NONBLOCK);
+    if (s_fd < 0) return ESP_FAIL;
+
+    struct v4l2_format fmt = {
+        .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+        .fmt.pix = {
+            .width = CAMERA_WIDTH,
+            .height = CAMERA_HEIGHT,
+            .pixelformat = V4L2_PIX_FMT_RGB565,
+        },
+    };
+    if (ioctl(s_fd, VIDIOC_S_FMT, &fmt) != 0) goto fail;
+    if (fmt.fmt.pix.width != CAMERA_WIDTH || fmt.fmt.pix.height != CAMERA_HEIGHT ||
+        fmt.fmt.pix.pixelformat != V4L2_PIX_FMT_RGB565) {
+        ESP_LOGW(TAG, "Camera negotiated %lux%lu fourcc=0x%08lx",
+                 (unsigned long)fmt.fmt.pix.width, (unsigned long)fmt.fmt.pix.height,
+                 (unsigned long)fmt.fmt.pix.pixelformat);
+    }
+
+    struct v4l2_requestbuffers req = {
+        .count = CAMERA_BUFFERS,
+        .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+        .memory = V4L2_MEMORY_MMAP,
+    };
+    if (ioctl(s_fd, VIDIOC_REQBUFS, &req) != 0 || req.count < 2) goto fail;
+
+    for (int i = 0; i < CAMERA_BUFFERS; ++i) {
+        struct v4l2_buffer b = {
+            .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+            .memory = V4L2_MEMORY_MMAP,
+            .index = i,
+        };
+        if (ioctl(s_fd, VIDIOC_QUERYBUF, &b) != 0) goto fail;
+        s_buffer_lengths[i] = b.length;
+        s_buffers[i] = mmap(NULL, b.length, PROT_READ | PROT_WRITE, MAP_SHARED, s_fd, b.m.offset);
+        if (s_buffers[i] == MAP_FAILED) goto fail;
+        if (ioctl(s_fd, VIDIOC_QBUF, &b) != 0) goto fail;
+    }
+
+    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (ioctl(s_fd, VIDIOC_STREAMON, &type) != 0) goto fail;
+
+    s_running = true;
+    if (xTaskCreate(capture_task, "camera", 8192, NULL, 6, &s_task) != pdPASS) {
+        s_running = false;
+        goto fail;
+    }
+    return ESP_OK;
+
+fail:
+    if (s_fd >= 0) close(s_fd);
+    s_fd = -1;
+    return ESP_FAIL;
 }
 
 esp_err_t camera_stop(void)
 {
-    if (!s_csi) return ESP_ERR_INVALID_STATE;
     if (!s_running) return ESP_OK;
-    s_running = false;
     recorder_set_active(false);
-    return wt_bsp_csi_stop(s_csi);
+    s_running = false;
+    for (int i = 0; i < 100 && s_task != NULL; ++i) vTaskDelay(pdMS_TO_TICKS(5));
+    return s_task == NULL ? ESP_OK : ESP_ERR_TIMEOUT;
 }
 
 bool camera_running(void)
