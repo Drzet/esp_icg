@@ -31,6 +31,11 @@
 #define CAMERA_WIDTH           1920
 #define CAMERA_HEIGHT          1080
 
+#define AE_TARGET_LUMA         100
+#define AE_DEADBAND            8
+#define AE_UPDATE_EVERY_FRAMES 4
+#define AE_SAMPLE_STEP         16
+
 /*
  * ESP32-P4 PPA scale factors are quantized to 1/16 steps. 1920x1080 ->
  * 480x280 cannot therefore use the naive ~0.259 scale: it is truncated to
@@ -44,6 +49,16 @@
 static const char *TAG = "imx708_preview";
 static ppa_client_handle_t s_ppa;
 static uint16_t *s_preview;
+
+typedef struct {
+    int64_t exposure_min;
+    int64_t exposure_max;
+    int64_t exposure_step;
+    int64_t exposure;
+    int64_t gain_min;
+    int64_t gain_max;
+    int64_t gain;
+} ae_state_t;
 
 static const esp_video_init_csi_config_t s_csi_config[] = {
     {
@@ -77,6 +92,149 @@ static esp_err_t camera_power_on(void)
     gpio_set_level(CAMERA_POWER_GPIO, 1);
     vTaskDelay(pdMS_TO_TICKS(100));
     return ESP_OK;
+}
+
+static int v4l2_get_control(int fd, uint32_t id, int64_t *value)
+{
+    struct v4l2_ext_control control = {
+        .id = id,
+    };
+    struct v4l2_ext_controls controls = {
+        .ctrl_class = V4L2_CTRL_ID2CLASS(id),
+        .count = 1,
+        .controls = &control,
+    };
+    if (ioctl(fd, VIDIOC_G_EXT_CTRLS, &controls) != 0) return -1;
+    *value = control.value64;
+    return 0;
+}
+
+static int v4l2_set_control(int fd, uint32_t id, int64_t value)
+{
+    struct v4l2_ext_control control = {
+        .id = id,
+        .value64 = value,
+    };
+    struct v4l2_ext_controls controls = {
+        .ctrl_class = V4L2_CTRL_ID2CLASS(id),
+        .count = 1,
+        .controls = &control,
+    };
+    return ioctl(fd, VIDIOC_S_EXT_CTRLS, &controls);
+}
+
+static esp_err_t ae_init(int fd, ae_state_t *ae)
+{
+    struct v4l2_query_ext_ctrl q = {
+        .id = V4L2_CID_EXPOSURE,
+    };
+    if (ioctl(fd, VIDIOC_QUERY_EXT_CTRL, &q) != 0) {
+        ESP_LOGE(TAG, "query exposure failed: errno=%d", errno);
+        return ESP_FAIL;
+    }
+    ae->exposure_min = q.minimum;
+    ae->exposure_max = q.maximum;
+    ae->exposure_step = q.step > 0 ? q.step : 1;
+
+    memset(&q, 0, sizeof(q));
+    q.id = V4L2_CID_GAIN;
+    if (ioctl(fd, VIDIOC_QUERY_EXT_CTRL, &q) != 0) {
+        ESP_LOGE(TAG, "query gain failed: errno=%d", errno);
+        return ESP_FAIL;
+    }
+    ae->gain_min = q.minimum;
+    ae->gain_max = q.maximum;
+
+    if (v4l2_get_control(fd, V4L2_CID_EXPOSURE, &ae->exposure) != 0) {
+        ae->exposure = ae->exposure_min;
+    }
+    if (v4l2_get_control(fd, V4L2_CID_GAIN, &ae->gain) != 0) {
+        ae->gain = ae->gain_min;
+    }
+
+    ESP_LOGI(TAG, "AE: target=%d exposure=%" PRId64 " [%" PRId64 "..%" PRId64 "] step=%" PRId64
+                  " gain_index=%" PRId64 " [%" PRId64 "..%" PRId64 "]",
+             AE_TARGET_LUMA,
+             ae->exposure, ae->exposure_min, ae->exposure_max, ae->exposure_step,
+             ae->gain, ae->gain_min, ae->gain_max);
+    return ESP_OK;
+}
+
+static uint32_t frame_luma_rgb565(const uint16_t *frame, uint32_t width, uint32_t height)
+{
+    uint64_t sum = 0;
+    uint32_t count = 0;
+
+    /* Meter the central 3/4 of the image so bright/dark borders matter less. */
+    const uint32_t x0 = width / 8;
+    const uint32_t x1 = width - x0;
+    const uint32_t y0 = height / 8;
+    const uint32_t y1 = height - y0;
+
+    for (uint32_t y = y0; y < y1; y += AE_SAMPLE_STEP) {
+        const uint16_t *row = frame + (size_t)y * width;
+        for (uint32_t x = x0; x < x1; x += AE_SAMPLE_STEP) {
+            uint16_t p = row[x];
+            uint32_t r = ((p >> 11) & 0x1f) * 255 / 31;
+            uint32_t g = ((p >> 5) & 0x3f) * 255 / 63;
+            uint32_t b = (p & 0x1f) * 255 / 31;
+            sum += (77 * r + 150 * g + 29 * b) >> 8;
+            ++count;
+        }
+    }
+    return count ? (uint32_t)(sum / count) : 0;
+}
+
+static int64_t align_step(int64_t value, int64_t step)
+{
+    if (step <= 1) return value;
+    return (value / step) * step;
+}
+
+static void ae_update(int fd, ae_state_t *ae, uint32_t luma)
+{
+    bool changed = false;
+
+    if (luma + AE_DEADBAND < AE_TARGET_LUMA) {
+        if (ae->exposure < ae->exposure_max) {
+            int64_t inc = ae->exposure / 8;
+            if (inc < ae->exposure_step) inc = ae->exposure_step;
+            int64_t next = align_step(ae->exposure + inc, ae->exposure_step);
+            if (next > ae->exposure_max) next = ae->exposure_max;
+            if (next != ae->exposure && v4l2_set_control(fd, V4L2_CID_EXPOSURE, next) == 0) {
+                ae->exposure = next;
+                changed = true;
+            }
+        } else if (ae->gain < ae->gain_max) {
+            int64_t next = ae->gain + 1;
+            if (v4l2_set_control(fd, V4L2_CID_GAIN, next) == 0) {
+                ae->gain = next;
+                changed = true;
+            }
+        }
+    } else if (luma > AE_TARGET_LUMA + AE_DEADBAND) {
+        if (ae->gain > ae->gain_min) {
+            int64_t next = ae->gain - 1;
+            if (v4l2_set_control(fd, V4L2_CID_GAIN, next) == 0) {
+                ae->gain = next;
+                changed = true;
+            }
+        } else if (ae->exposure > ae->exposure_min) {
+            int64_t dec = ae->exposure / 8;
+            if (dec < ae->exposure_step) dec = ae->exposure_step;
+            int64_t next = align_step(ae->exposure - dec, ae->exposure_step);
+            if (next < ae->exposure_min) next = ae->exposure_min;
+            if (next != ae->exposure && v4l2_set_control(fd, V4L2_CID_EXPOSURE, next) == 0) {
+                ae->exposure = next;
+                changed = true;
+            }
+        }
+    }
+
+    if (changed) {
+        ESP_LOGI(TAG, "AE: luma=%" PRIu32 " exposure=%" PRId64 " gain_index=%" PRId64,
+                 luma, ae->exposure, ae->gain);
+    }
 }
 
 static esp_err_t preview_frame(const uint8_t *frame, uint32_t width, uint32_t height, size_t len)
@@ -129,10 +287,8 @@ static esp_err_t run_preview(int fd)
 {
     uint8_t *buffers[CAMERA_BUFFER_COUNT] = {0};
     size_t lengths[CAMERA_BUFFER_COUNT] = {0};
+    ae_state_t ae = {0};
 
-    /* Explicitly configure the ISP output before allocating buffers/streaming.
-     * The IMX708 reference path does this with VIDIOC_S_FMT rather than relying
-     * on the device's implicit defaults. */
     struct v4l2_format fmt = {
         .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
     };
@@ -161,6 +317,10 @@ static esp_err_t run_preview(int fd)
     if (fmt.fmt.pix.pixelformat != V4L2_PIX_FMT_RGB565) {
         ESP_LOGE(TAG, "expected RGB565 from ISP, got 0x%08" PRIx32, fmt.fmt.pix.pixelformat);
         return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    if (ae_init(fd, &ae) != ESP_OK) {
+        return ESP_FAIL;
     }
 
     struct v4l2_requestbuffers req = {
@@ -214,6 +374,12 @@ static esp_err_t run_preview(int fd)
         if (b.index >= count || !buffers[b.index]) {
             ESP_LOGE(TAG, "invalid camera buffer index");
             break;
+        }
+
+        if ((frames % AE_UPDATE_EVERY_FRAMES) == 0) {
+            uint32_t luma = frame_luma_rgb565((const uint16_t *)buffers[b.index],
+                                              fmt.fmt.pix.width, fmt.fmt.pix.height);
+            ae_update(fd, &ae, luma);
         }
 
         esp_err_t ret = preview_frame(buffers[b.index], fmt.fmt.pix.width,
