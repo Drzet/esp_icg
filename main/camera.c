@@ -3,6 +3,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "driver/ppa.h"
+#include "esp_check.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "linux/videodev2.h"
@@ -62,12 +63,8 @@ static void camera_frame_cb(uint8_t *buf, uint32_t width, uint32_t height, size_
     };
 
     esp_err_t ret = ppa_do_scale_rotate_mirror(s_ppa, &op);
-    if (ret == ESP_OK) {
-        ret = display_draw_preview(s_preview);
-    }
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "preview frame failed: %s", esp_err_to_name(ret));
-    }
+    if (ret == ESP_OK) ret = display_draw_preview(s_preview);
+    if (ret != ESP_OK) ESP_LOGW(TAG, "preview frame failed: %s", esp_err_to_name(ret));
 
     xSemaphoreGive(s_preview_lock);
 }
