@@ -1,5 +1,6 @@
 #include "storage.h"
 
+#include <stdio.h>
 #include "sdkconfig.h"
 #include "driver/spi_master.h"
 #include "esp_log.h"
@@ -36,7 +37,7 @@ esp_err_t storage_init(void)
 
     sdmmc_host_t host = SDSPI_HOST_DEFAULT();
     host.slot = ICG_SD_HOST;
-    host.max_freq_khz = 10000; /* conservative for jumper wires / display adapter */
+    host.max_freq_khz = 10000;
 
     sdspi_device_config_t slot = SDSPI_DEVICE_CONFIG_DEFAULT();
     slot.gpio_cs = CONFIG_ICG_SD_CS_GPIO;
