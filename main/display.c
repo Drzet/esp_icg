@@ -3,12 +3,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include "driver/spi_master.h"
+#include "esp_check.h"
 #include "esp_heap_caps.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_ili9488.h"
 #include "app_config.h"
 
+static const char *TAG = "display";
 static esp_lcd_panel_handle_t s_panel;
 static uint16_t *s_ui_line;
 
@@ -25,7 +27,8 @@ static esp_err_t fill_rect(int x0, int y0, int x1, int y1, uint16_t color)
     const int w = x1 - x0;
     for (int x = 0; x < w; ++x) s_ui_line[x] = color;
     for (int y = y0; y < y1; ++y) {
-        ESP_ERROR_CHECK(esp_lcd_panel_draw_bitmap(s_panel, x0, y, x1, y + 1, s_ui_line));
+        esp_err_t ret = esp_lcd_panel_draw_bitmap(s_panel, x0, y, x1, y + 1, s_ui_line);
+        if (ret != ESP_OK) return ret;
     }
     return ESP_OK;
 }
@@ -116,7 +119,6 @@ esp_err_t display_draw_ui(bool camera_running, bool recording, bool sd_ready)
     ESP_RETURN_ON_ERROR(draw_stop_icon(), TAG, "stop");
     ESP_RETURN_ON_ERROR(draw_record_icon(recording), TAG, "record");
 
-    /* Tiny status bars: green = camera running, blue = SD ready. */
     if (camera_running) ESP_RETURN_ON_ERROR(fill_rect(4, 283, 28, 286, rgb565(40, 220, 60)), TAG, "camera status");
     if (sd_ready) ESP_RETURN_ON_ERROR(fill_rect(452, 283, 476, 286, rgb565(60, 120, 255)), TAG, "sd status");
     return ESP_OK;
