@@ -1,2 +1,19 @@
-idf_component_register(SRCS "ili9488_test.c"
-                       INCLUDE_DIRS ".")
+idf_component_register(
+    SRCS
+        "app_main.c"
+        "camera.c"
+        "display.c"
+        "recorder.c"
+        "storage.c"
+        "touch.c"
+    INCLUDE_DIRS "."
+    PRIV_REQUIRES
+        esp_driver_spi
+        esp_driver_gpio
+        esp_driver_ppa
+        esp_driver_jpeg
+        esp_lcd
+        fatfs
+        sdmmc
+        wt_bsp
+)
