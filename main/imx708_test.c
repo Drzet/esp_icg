@@ -28,6 +28,8 @@
 #define CAMERA_BUFFER_COUNT    3
 #define PPA_CACHE_LINE_SIZE    128
 #define PREVIEW_BUFFER_SIZE    (ICG_LCD_WIDTH * ICG_PREVIEW_HEIGHT * sizeof(uint16_t))
+#define CAMERA_WIDTH           1920
+#define CAMERA_HEIGHT          1080
 
 /*
  * ESP32-P4 PPA scale factors are quantized to 1/16 steps. 1920x1080 ->
@@ -128,9 +130,22 @@ static esp_err_t run_preview(int fd)
     uint8_t *buffers[CAMERA_BUFFER_COUNT] = {0};
     size_t lengths[CAMERA_BUFFER_COUNT] = {0};
 
+    /* Explicitly configure the ISP output before allocating buffers/streaming.
+     * The IMX708 reference path does this with VIDIOC_S_FMT rather than relying
+     * on the device's implicit defaults. */
     struct v4l2_format fmt = {
         .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
     };
+    fmt.fmt.pix.width = CAMERA_WIDTH;
+    fmt.fmt.pix.height = CAMERA_HEIGHT;
+    fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_RGB565;
+    if (ioctl(fd, VIDIOC_S_FMT, &fmt) != 0) {
+        ESP_LOGE(TAG, "VIDIOC_S_FMT failed: errno=%d", errno);
+        return ESP_FAIL;
+    }
+
+    memset(&fmt, 0, sizeof(fmt));
+    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     if (ioctl(fd, VIDIOC_G_FMT, &fmt) != 0) {
         ESP_LOGE(TAG, "VIDIOC_G_FMT failed: errno=%d", errno);
         return ESP_FAIL;
