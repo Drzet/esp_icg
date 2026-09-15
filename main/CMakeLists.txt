@@ -4,7 +4,7 @@ idf_component_register(
         "display.c"
     INCLUDE_DIRS "."
     REQUIRES
-        esp_video
+        claw_video
         esp_cam_sensor_imx
         esp_driver_gpio
         esp_driver_ppa
