@@ -2,6 +2,8 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "driver/spi_master.h"
 #include "esp_check.h"
 #include "esp_heap_caps.h"
@@ -13,10 +15,46 @@
 static const char *TAG = "display";
 static esp_lcd_panel_handle_t s_panel;
 static uint16_t *s_ui_line;
+static SemaphoreHandle_t s_lcd_mutex;
+static SemaphoreHandle_t s_lcd_done;
+
+static bool lcd_color_done_cb(esp_lcd_panel_io_handle_t panel_io,
+                              esp_lcd_panel_io_event_data_t *edata,
+                              void *user_ctx)
+{
+    (void)panel_io;
+    (void)edata;
+    (void)user_ctx;
+    BaseType_t high_task_woken = pdFALSE;
+    xSemaphoreGiveFromISR(s_lcd_done, &high_task_woken);
+    return high_task_woken == pdTRUE;
+}
 
 static inline uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b)
 {
     return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
+}
+
+static esp_err_t draw_bitmap_sync(int x0, int y0, int x1, int y1, const void *pixels)
+{
+    if (!s_panel || !pixels || !s_lcd_mutex || !s_lcd_done) return ESP_ERR_INVALID_STATE;
+
+    if (xSemaphoreTake(s_lcd_mutex, portMAX_DELAY) != pdTRUE) return ESP_ERR_TIMEOUT;
+
+    while (xSemaphoreTake(s_lcd_done, 0) == pdTRUE) {
+        /* Drain a stale completion token before starting a new transfer. */
+    }
+
+    esp_err_t ret = esp_lcd_panel_draw_bitmap(s_panel, x0, y0, x1, y1, pixels);
+    if (ret == ESP_OK) {
+        if (xSemaphoreTake(s_lcd_done, pdMS_TO_TICKS(1000)) != pdTRUE) {
+            ESP_LOGE(TAG, "LCD transfer timeout");
+            ret = ESP_ERR_TIMEOUT;
+        }
+    }
+
+    xSemaphoreGive(s_lcd_mutex);
+    return ret;
 }
 
 static esp_err_t fill_rect(int x0, int y0, int x1, int y1, uint16_t color)
@@ -27,7 +65,7 @@ static esp_err_t fill_rect(int x0, int y0, int x1, int y1, uint16_t color)
     const int w = x1 - x0;
     for (int x = 0; x < w; ++x) s_ui_line[x] = color;
     for (int y = y0; y < y1; ++y) {
-        esp_err_t ret = esp_lcd_panel_draw_bitmap(s_panel, x0, y, x1, y + 1, s_ui_line);
+        esp_err_t ret = draw_bitmap_sync(x0, y, x1, y + 1, s_ui_line);
         if (ret != ESP_OK) return ret;
     }
     return ESP_OK;
@@ -63,6 +101,10 @@ static esp_err_t draw_record_icon(bool active)
 
 esp_err_t display_init(void)
 {
+    s_lcd_mutex = xSemaphoreCreateMutex();
+    s_lcd_done = xSemaphoreCreateBinary();
+    if (!s_lcd_mutex || !s_lcd_done) return ESP_ERR_NO_MEM;
+
     spi_bus_config_t buscfg = {
         .sclk_io_num = ICG_LCD_PIN_SCLK,
         .mosi_io_num = ICG_LCD_PIN_MOSI,
@@ -81,7 +123,8 @@ esp_err_t display_init(void)
         .lcd_cmd_bits = 8,
         .lcd_param_bits = 8,
         .spi_mode = 0,
-        .trans_queue_depth = 10,
+        .trans_queue_depth = 1,
+        .on_color_trans_done = lcd_color_done_cb,
     };
     ESP_RETURN_ON_ERROR(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)ICG_LCD_HOST, &io_cfg, &io), TAG, "lcd io");
 
@@ -105,7 +148,7 @@ esp_err_t display_init(void)
 esp_err_t display_draw_preview(const uint16_t *rgb565_frame)
 {
     if (!s_panel || !rgb565_frame) return ESP_ERR_INVALID_ARG;
-    return esp_lcd_panel_draw_bitmap(s_panel, 0, 0, ICG_LCD_WIDTH, ICG_PREVIEW_HEIGHT, rgb565_frame);
+    return draw_bitmap_sync(0, 0, ICG_LCD_WIDTH, ICG_PREVIEW_HEIGHT, rgb565_frame);
 }
 
 esp_err_t display_draw_ui(bool camera_running, bool recording, bool sd_ready)
