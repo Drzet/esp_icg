@@ -133,9 +133,19 @@ esp_err_t display_init(void)
         .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
         .bits_per_pixel = 18,
     };
+
+    /*
+     * The driver conversion buffer is specified in pixels.  Keep it to one
+     * 480-pixel landscape scanline and never submit a larger rectangle in a
+     * single draw call; the ILI9488 SPI driver expands RGB565 to RGB666 into
+     * this buffer before transmission.
+     */
     ESP_RETURN_ON_ERROR(esp_lcd_new_panel_ili9488_ips(io, &panel_cfg, ICG_LCD_WIDTH, &s_panel), TAG, "ili9488");
     ESP_RETURN_ON_ERROR(esp_lcd_panel_reset(s_panel), TAG, "lcd reset");
     ESP_RETURN_ON_ERROR(esp_lcd_panel_init(s_panel), TAG, "lcd init");
+
+    /* Native controller geometry is 320x480; the application is 480x320. */
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_swap_xy(s_panel, true), TAG, "lcd landscape");
     ESP_RETURN_ON_ERROR(esp_lcd_panel_disp_on_off(s_panel, true), TAG, "lcd on");
 
     s_ui_line = heap_caps_malloc(ICG_LCD_WIDTH * sizeof(uint16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
@@ -148,7 +158,18 @@ esp_err_t display_init(void)
 esp_err_t display_draw_preview(const uint16_t *rgb565_frame)
 {
     if (!s_panel || !rgb565_frame) return ESP_ERR_INVALID_ARG;
-    return draw_bitmap_sync(0, 0, ICG_LCD_WIDTH, ICG_PREVIEW_HEIGHT, rgb565_frame);
+
+    /*
+     * One scanline per transaction: esp_lcd_ili9488's RGB565->RGB666
+     * conversion buffer is only ICG_LCD_WIDTH pixels.  Passing the complete
+     * 480x280 frame would overrun that buffer and corrupt memory.
+     */
+    for (int y = 0; y < ICG_PREVIEW_HEIGHT; ++y) {
+        const uint16_t *line = rgb565_frame + (size_t)y * ICG_LCD_WIDTH;
+        esp_err_t ret = draw_bitmap_sync(0, y, ICG_LCD_WIDTH, y + 1, line);
+        if (ret != ESP_OK) return ret;
+    }
+    return ESP_OK;
 }
 
 esp_err_t display_draw_ui(bool camera_running, bool recording, bool sd_ready)
