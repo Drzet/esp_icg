@@ -1,0 +1,49 @@
+name: ESP IPA ISA diagnostic
+
+on:
+  push:
+    branches:
+      - investigate/esp-ipa-isa
+  workflow_dispatch:
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v6.0.3
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Inspect ESP IPA prebuilt ISA
+        shell: bash
+        run: |
+          set -euo pipefail
+          source /opt/esp/idf/export.sh
+          OBJDUMP="$(command -v riscv32-esp-elf-objdump)"
+          mkdir -p /tmp/ipa
+
+          inspect_one() {
+            label="$1"
+            ref="$2"
+            url="https://raw.githubusercontent.com/espressif/esp-video-components/${ref}/esp_ipa/lib/esp32p4/v6.0+/libesp_ipa.a"
+            out="/tmp/ipa/${label}.a"
+            echo "=== ${label} @ ${ref} ==="
+            curl -fL "$url" -o "$out"
+            sha256sum "$out"
+            echo "Zba mnemonic counts:"
+            "$OBJDUMP" -d "$out" > "/tmp/ipa/${label}.S"
+            for op in sh1add sh2add sh3add; do
+              printf '%s=' "$op"
+              grep -Ec "[[:space:]]${op}[[:space:]]" "/tmp/ipa/${label}.S" || true
+            done
+            echo "esp_ipa_pipeline_create excerpt:"
+            grep -n -A40 -B5 '<esp_ipa_pipeline_create>:' "/tmp/ipa/${label}.S" | head -n 60 || true
+            echo
+          }
+
+          inspect_one ipa_2_1_0 fa329403e87e31dc3ddc1853dd171630fb063566
+          inspect_one ipa_2_2_0 4a707c985706f49f9ef17a8d0d38d058846dae40
+          inspect_one ipa_2_3_0 b66c33ba75ff233da3dfaf4456158fdff8649b99
+          inspect_one ipa_current c132be656b3159a6e06db70aaa850885c6680435
