@@ -109,11 +109,11 @@ static esp_err_t preview_frame(const uint8_t *frame, uint32_t width, uint32_t he
             .block_offset_y = 0,
             .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
         },
-        .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
+        .rotation_angle = PPA_SRM_ROTATION_ANGLE_180,
         .scale_x = PREVIEW_SCALE,
         .scale_y = PREVIEW_SCALE,
         .mirror_x = false,
-        .mirror_y = true,
+        .mirror_y = false,
         .mode = PPA_TRANS_MODE_BLOCKING,
     };
 
@@ -182,7 +182,7 @@ static esp_err_t run_preview(int fd)
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "live preview started: crop=%dx%d scale=5/16",
+    ESP_LOGI(TAG, "live preview started: crop=%dx%d scale=5/16 rotation=180",
              PREVIEW_CROP_WIDTH, PREVIEW_CROP_HEIGHT);
     uint32_t frames = 0;
 
