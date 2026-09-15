@@ -17,7 +17,7 @@ project(esp_icg)
 # esp_ipa 2.3 ioctl API. The application does not use those wrappers; force a
 # tiny compatibility shim only for claw_video so the rest of the 2.2 ABI stays
 # untouched.
-idf_component_get_property(claw_video_lib claw_video COMPONENT_LIB)
+idf_component_get_property(claw_video_lib tda-2030__claw_video COMPONENT_LIB)
 target_compile_options(${claw_video_lib} PRIVATE
     "-include${CMAKE_SOURCE_DIR}/config/esp_ipa_22_compat.h"
 )
