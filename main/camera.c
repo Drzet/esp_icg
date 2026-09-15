@@ -35,6 +35,25 @@ static TaskHandle_t s_task;
 static int s_fd = -1;
 static void *s_buffers[CAMERA_BUFFERS];
 static size_t s_buffer_lengths[CAMERA_BUFFERS];
+static uint32_t s_buffer_count;
+static uint32_t s_frame_width = CAMERA_WIDTH;
+static uint32_t s_frame_height = CAMERA_HEIGHT;
+
+static void cleanup_capture(void)
+{
+    for (uint32_t i = 0; i < s_buffer_count; ++i) {
+        if (s_buffers[i] && s_buffers[i] != MAP_FAILED) {
+            munmap(s_buffers[i], s_buffer_lengths[i]);
+        }
+        s_buffers[i] = NULL;
+        s_buffer_lengths[i] = 0;
+    }
+    s_buffer_count = 0;
+    if (s_fd >= 0) {
+        close(s_fd);
+        s_fd = -1;
+    }
+}
 
 static void render_frame(uint8_t *buf, uint32_t width, uint32_t height, size_t len)
 {
@@ -97,8 +116,8 @@ static void capture_task(void *arg)
             continue;
         }
 
-        if ((b.flags & V4L2_BUF_FLAG_DONE) && b.index < CAMERA_BUFFERS) {
-            render_frame((uint8_t *)s_buffers[b.index], CAMERA_WIDTH, CAMERA_HEIGHT, b.bytesused);
+        if ((b.flags & V4L2_BUF_FLAG_DONE) && b.index < s_buffer_count) {
+            render_frame((uint8_t *)s_buffers[b.index], s_frame_width, s_frame_height, b.bytesused);
         }
 
         if (ioctl(s_fd, VIDIOC_QBUF, &b) != 0) {
@@ -108,14 +127,7 @@ static void capture_task(void *arg)
 
     enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     ioctl(s_fd, VIDIOC_STREAMOFF, &type);
-    for (int i = 0; i < CAMERA_BUFFERS; ++i) {
-        if (s_buffers[i] && s_buffers[i] != MAP_FAILED) {
-            munmap(s_buffers[i], s_buffer_lengths[i]);
-            s_buffers[i] = NULL;
-        }
-    }
-    close(s_fd);
-    s_fd = -1;
+    cleanup_capture();
     s_task = NULL;
     vTaskDelete(NULL);
 }
@@ -165,6 +177,10 @@ esp_err_t camera_start(void)
 {
     if (s_running) return ESP_OK;
 
+    memset(s_buffers, 0, sizeof(s_buffers));
+    memset(s_buffer_lengths, 0, sizeof(s_buffer_lengths));
+    s_buffer_count = 0;
+
     s_fd = open(CAMERA_DEV, O_RDONLY | O_NONBLOCK);
     if (s_fd < 0) return ESP_FAIL;
 
@@ -177,12 +193,13 @@ esp_err_t camera_start(void)
         },
     };
     if (ioctl(s_fd, VIDIOC_S_FMT, &fmt) != 0) goto fail;
-    if (fmt.fmt.pix.width != CAMERA_WIDTH || fmt.fmt.pix.height != CAMERA_HEIGHT ||
-        fmt.fmt.pix.pixelformat != V4L2_PIX_FMT_RGB565) {
-        ESP_LOGW(TAG, "Camera negotiated %lux%lu fourcc=0x%08lx",
-                 (unsigned long)fmt.fmt.pix.width, (unsigned long)fmt.fmt.pix.height,
-                 (unsigned long)fmt.fmt.pix.pixelformat);
+    if (fmt.fmt.pix.pixelformat != V4L2_PIX_FMT_RGB565) {
+        ESP_LOGE(TAG, "RGB565 was not accepted, fourcc=0x%08lx", (unsigned long)fmt.fmt.pix.pixelformat);
+        goto fail;
     }
+    s_frame_width = fmt.fmt.pix.width;
+    s_frame_height = fmt.fmt.pix.height;
+    ESP_LOGI(TAG, "Camera format %lux%lu RGB565", (unsigned long)s_frame_width, (unsigned long)s_frame_height);
 
     struct v4l2_requestbuffers req = {
         .count = CAMERA_BUFFERS,
@@ -190,8 +207,9 @@ esp_err_t camera_start(void)
         .memory = V4L2_MEMORY_MMAP,
     };
     if (ioctl(s_fd, VIDIOC_REQBUFS, &req) != 0 || req.count < 2) goto fail;
+    s_buffer_count = req.count > CAMERA_BUFFERS ? CAMERA_BUFFERS : req.count;
 
-    for (int i = 0; i < CAMERA_BUFFERS; ++i) {
+    for (uint32_t i = 0; i < s_buffer_count; ++i) {
         struct v4l2_buffer b = {
             .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
             .memory = V4L2_MEMORY_MMAP,
@@ -200,7 +218,10 @@ esp_err_t camera_start(void)
         if (ioctl(s_fd, VIDIOC_QUERYBUF, &b) != 0) goto fail;
         s_buffer_lengths[i] = b.length;
         s_buffers[i] = mmap(NULL, b.length, PROT_READ | PROT_WRITE, MAP_SHARED, s_fd, b.m.offset);
-        if (s_buffers[i] == MAP_FAILED) goto fail;
+        if (s_buffers[i] == MAP_FAILED) {
+            s_buffers[i] = NULL;
+            goto fail;
+        }
         if (ioctl(s_fd, VIDIOC_QBUF, &b) != 0) goto fail;
     }
 
@@ -210,13 +231,13 @@ esp_err_t camera_start(void)
     s_running = true;
     if (xTaskCreate(capture_task, "camera", 8192, NULL, 6, &s_task) != pdPASS) {
         s_running = false;
+        ioctl(s_fd, VIDIOC_STREAMOFF, &type);
         goto fail;
     }
     return ESP_OK;
 
 fail:
-    if (s_fd >= 0) close(s_fd);
-    s_fd = -1;
+    cleanup_capture();
     return ESP_FAIL;
 }
 
