@@ -1,7 +1,6 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
-#include "wt_bsp.h"
 #include "camera.h"
 #include "display.h"
 #include "recorder.h"
@@ -32,10 +31,8 @@ static void ui_task(void *arg)
             } else if (x < 320) {
                 esp_err_t ret = camera_stop();
                 if (ret != ESP_OK) ESP_LOGW(TAG, "STOP failed: %s", esp_err_to_name(ret));
-            } else {
-                if (camera_running() && storage_ready()) {
-                    recorder_set_active(!recorder_active());
-                }
+            } else if (camera_running() && storage_ready()) {
+                recorder_set_active(!recorder_active());
             }
             refresh_ui();
         }
@@ -56,9 +53,6 @@ void app_main(void)
     }
 
     ESP_ERROR_CHECK(recorder_init());
-
-    ESP_LOGI(TAG, "Initializing WT9932P4-TINY BSP / CSI");
-    ESP_ERROR_CHECK(wt_bsp_init());
     ESP_ERROR_CHECK(camera_init());
 
     refresh_ui();
