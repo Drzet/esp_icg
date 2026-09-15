@@ -1,0 +1,40 @@
+name: ESP-IDF build
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v6.0.3
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build ESP32-P4 firmware
+        shell: bash
+        run: |
+          source /opt/esp/idf/export.sh
+          idf.py --version
+          python --version
+          idf.py set-target esp32p4
+          idf.py build
+
+      - name: Upload firmware
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp_icg-imx708-esp32p4
+          path: |
+            build/*.bin
+            build/*.elf
+            build/*.map
+            build/bootloader/*.bin
+            build/partition_table/*.bin
+          if-no-files-found: error
