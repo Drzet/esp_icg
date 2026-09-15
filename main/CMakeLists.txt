@@ -13,7 +13,7 @@ idf_component_register(
         esp_driver_ppa
         esp_driver_jpeg
         esp_lcd
+        esp_video
         fatfs
         sdmmc
-        wt_bsp
 )
