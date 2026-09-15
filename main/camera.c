@@ -26,6 +26,8 @@
 #define CAMERA_SCCB_SCL 8
 #define CAMERA_SCCB_SDA 7
 #define CAMERA_POWER_GPIO 0
+#define PPA_CACHE_LINE_SIZE 128
+#define PREVIEW_BUFFER_SIZE (ICG_LCD_WIDTH * ICG_PREVIEW_HEIGHT * sizeof(uint16_t))
 
 static const char *TAG = "camera";
 static ppa_client_handle_t s_ppa;
@@ -80,7 +82,7 @@ static void render_frame(uint8_t *buf, uint32_t width, uint32_t height, size_t l
         },
         .out = {
             .buffer = s_preview,
-            .buffer_size = ICG_LCD_WIDTH * ICG_PREVIEW_HEIGHT * sizeof(uint16_t),
+            .buffer_size = PREVIEW_BUFFER_SIZE,
             .pic_w = ICG_LCD_WIDTH,
             .pic_h = ICG_PREVIEW_HEIGHT,
             .block_offset_x = 0,
@@ -168,9 +170,12 @@ esp_err_t camera_init(void)
     };
     ESP_RETURN_ON_ERROR(ppa_register_client(&ppa_cfg, &s_ppa), TAG, "PPA client");
 
-    s_preview = heap_caps_malloc(ICG_LCD_WIDTH * ICG_PREVIEW_HEIGHT * sizeof(uint16_t),
-                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    return s_preview ? ESP_OK : ESP_ERR_NO_MEM;
+    s_preview = heap_caps_aligned_alloc(PPA_CACHE_LINE_SIZE, PREVIEW_BUFFER_SIZE,
+                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_preview) return ESP_ERR_NO_MEM;
+    ESP_LOGI(TAG, "PPA preview buffer @%p, size=%u, alignment=%u",
+             s_preview, (unsigned)PREVIEW_BUFFER_SIZE, PPA_CACHE_LINE_SIZE);
+    return ESP_OK;
 }
 
 esp_err_t camera_start(void)
