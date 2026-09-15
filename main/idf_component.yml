@@ -2,3 +2,6 @@ dependencies:
   idf:
     version: ">=6.0.0"
   atanisoft/esp_lcd_ili9488: "^1.1.1"
+  wt_bsp:
+    git: https://github.com/Wireless-TAG-Maker/WT_BSP.git
+    path: components/wt_bsp
