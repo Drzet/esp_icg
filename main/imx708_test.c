@@ -13,12 +13,14 @@
 #include "esp_log.h"
 #include "esp_video_device.h"
 #include "esp_video_init.h"
+#include "esp_video_isp_pipeline.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "linux/videodev2.h"
 
 #include "app_config.h"
 #include "display.h"
+#include "touch.h"
 
 #define CAMERA_POWER_GPIO      0
 #define CAMERA_SCCB_I2C_PORT   0
@@ -31,15 +33,27 @@
 #define PREVIEW_BUFFER_COUNT   3
 #define DISPLAY_TASK_STACK     4096
 #define DISPLAY_TASK_PRIORITY  (tskIDLE_PRIORITY + 1)
+#define TOUCH_TASK_STACK       3072
+#define TOUCH_TASK_PRIORITY    (tskIDLE_PRIORITY + 1)
+#define PREVIEW_BORDER_PIXELS  2
+
+/* Three 156-pixel touch strips with two 6-pixel dead gaps: 156*3 + 6*2 = 480. */
+#define TOUCH_ZONE_WIDTH       156
+#define TOUCH_ZONE_GAP         6
+
+/* Manual focus guard range for the standard ~75-degree Camera Module 3 lens. */
+#define FOCUS_CODE_1M          477
+#define FOCUS_CODE_30CM        552
+#define FOCUS_STEPS            26
 
 /*
- * ESP32-P4 PPA scale factors are quantized to 1/16 steps. 1920x1080 ->
- * 480x280 cannot therefore use the naive ~0.259 scale: it is truncated to
- * 0.25, producing a smaller block and leaving stale strips at the right and
- * bottom. A centered 1536x896 crop scales exactly by 5/16 to 480x280.
+ * PPA scale factors are quantized to 1/16. A centered 1536x1024 crop scales
+ * exactly by 5/16 to 480x320, filling the landscape LCD without distortion.
+ * Compared with the old 1536x896 -> 480x280 preview this crops a little more of
+ * the sensor horizontally but removes the unused bottom strip.
  */
 #define PREVIEW_CROP_WIDTH     1536
-#define PREVIEW_CROP_HEIGHT    896
+#define PREVIEW_CROP_HEIGHT    1024
 #define PREVIEW_SCALE          (5.0f / 16.0f)
 
 static const char *TAG = "imx708_preview";
@@ -51,6 +65,33 @@ static int s_latest_preview = -1;
 static int s_display_preview = -1;
 static volatile uint32_t s_display_frames;
 static volatile uint32_t s_dropped_previews;
+
+/*
+ * Exposure slider uses roughly one-third-stop spacing. The sensor accepts any
+ * even line count in this range, but logarithmic steps give useful control at
+ * both the short and long ends instead of wasting most of the slider travel.
+ */
+static const uint16_t s_exposure_steps[] = {
+    4, 6, 8, 10, 12, 16, 20, 26, 32, 40,
+    50, 64, 80, 102, 128, 162, 204, 256, 322, 406,
+    512, 646, 812, 1024, 1290, 1626, 2048, 2580, 2624,
+};
+
+/* Requests are produced by touch_task and consumed between captured frames. */
+typedef struct {
+    bool exposure_pending;
+    int32_t exposure_lines;
+    bool gain_pending;
+    int32_t gain_index;
+    bool focus_pending;
+    int32_t focus_code;
+} control_requests_t;
+
+static portMUX_TYPE s_control_lock = portMUX_INITIALIZER_UNLOCKED;
+static control_requests_t s_control_requests;
+static bool s_manual_ae;
+static bool s_manual_focus;
+static int32_t s_manual_focus_code = FOCUS_CODE_1M;
 
 static const esp_video_init_csi_config_t s_csi_config[] = {
     {
@@ -68,11 +109,6 @@ static const esp_video_init_csi_config_t s_csi_config[] = {
     },
 };
 
-/*
- * The DW9807 autofocus VCM is a separate SCCB device from the IMX708 sensor.
- * It must be registered independently so esp_video probes and exposes it to
- * the ISP/IPA autofocus pipeline.
- */
 static const esp_video_init_cam_motor_config_t s_motor_config[] = {
     {
         .sccb_config = {
@@ -109,36 +145,203 @@ static esp_err_t camera_power_on(void)
     return ESP_OK;
 }
 
-/*
- * Exposure and gain are USER-class controls on the camera video node. Reading
- * them back while streaming tells us whether IPA/AE is actually commanding the
- * sensor, independently of what the preview looks like.
- */
 static bool read_user_ctrl(int fd, uint32_t id, int32_t *out)
 {
-    struct v4l2_ext_control ctrl = {
-        .id = id,
-    };
+    struct v4l2_ext_control ctrl = { .id = id };
     struct v4l2_ext_controls ctrls = {
         .ctrl_class = V4L2_CTRL_CLASS_USER,
         .count = 1,
         .controls = &ctrl,
     };
 
-    if (ioctl(fd, VIDIOC_G_EXT_CTRLS, &ctrls) != 0) {
-        return false;
-    }
-
+    if (ioctl(fd, VIDIOC_G_EXT_CTRLS, &ctrls) != 0) return false;
     *out = ctrl.value;
     return true;
 }
 
-/*
- * Pick a preview buffer that is neither being transmitted to the LCD nor the
- * newest frame waiting for the LCD. With three buffers there is always one
- * available: display-busy, latest-pending, and capture-write can all be
- * different buffers.
- */
+static bool write_user_ctrl(int fd, uint32_t id, int32_t value)
+{
+    struct v4l2_ext_control ctrl = { .id = id, .value = value };
+    struct v4l2_ext_controls ctrls = {
+        .ctrl_class = V4L2_CTRL_CLASS_USER,
+        .count = 1,
+        .controls = &ctrl,
+    };
+    return ioctl(fd, VIDIOC_S_EXT_CTRLS, &ctrls) == 0;
+}
+
+static bool write_focus_ctrl(int fd, int32_t value)
+{
+    struct v4l2_ext_control ctrl = {
+        .id = V4L2_CID_FOCUS_ABSOLUTE,
+        .value = value,
+    };
+    struct v4l2_ext_controls ctrls = {
+        .ctrl_class = V4L2_CID_CAMERA_CLASS,
+        .count = 1,
+        .controls = &ctrl,
+    };
+    return ioctl(fd, VIDIOC_S_EXT_CTRLS, &ctrls) == 0;
+}
+
+static int touch_zone_from_x(int x)
+{
+    if (x >= 0 && x < TOUCH_ZONE_WIDTH) return 0;
+
+    int z1 = TOUCH_ZONE_WIDTH + TOUCH_ZONE_GAP;
+    if (x >= z1 && x < z1 + TOUCH_ZONE_WIDTH) return 1;
+
+    int z2 = z1 + TOUCH_ZONE_WIDTH + TOUCH_ZONE_GAP;
+    if (x >= z2 && x < z2 + TOUCH_ZONE_WIDTH) return 2;
+
+    return -1;
+}
+
+static int slider_step_from_y(int y, int count)
+{
+    if (y < 0) y = 0;
+    if (y >= ICG_LCD_HEIGHT) y = ICG_LCD_HEIGHT - 1;
+
+    /* Bottom is step 0, top is the highest step. */
+    int travel = ICG_LCD_HEIGHT - 1 - y;
+    return (travel * (count - 1) + (ICG_LCD_HEIGHT - 1) / 2) /
+           (ICG_LCD_HEIGHT - 1);
+}
+
+static void queue_exposure(int32_t lines)
+{
+    portENTER_CRITICAL(&s_control_lock);
+    s_control_requests.exposure_lines = lines;
+    s_control_requests.exposure_pending = true;
+    portEXIT_CRITICAL(&s_control_lock);
+}
+
+static void queue_gain(int32_t index)
+{
+    portENTER_CRITICAL(&s_control_lock);
+    s_control_requests.gain_index = index;
+    s_control_requests.gain_pending = true;
+    portEXIT_CRITICAL(&s_control_lock);
+}
+
+static void queue_focus(int32_t code)
+{
+    portENTER_CRITICAL(&s_control_lock);
+    s_control_requests.focus_code = code;
+    s_control_requests.focus_pending = true;
+    portEXIT_CRITICAL(&s_control_lock);
+}
+
+static void touch_task(void *arg)
+{
+    (void)arg;
+    int active_zone = -1;
+    int active_step = -1;
+
+    while (true) {
+        touch_point_t p;
+        if (!touch_read(&p)) {
+            active_zone = -1;
+            active_step = -1;
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+
+        int zone = touch_zone_from_x(p.x);
+        if (zone < 0) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+
+        int step;
+        if (zone == 0) {
+            step = slider_step_from_y(p.y, (int)(sizeof(s_exposure_steps) / sizeof(s_exposure_steps[0])));
+        } else if (zone == 1) {
+            step = slider_step_from_y(p.y, 47);
+        } else {
+            step = slider_step_from_y(p.y, FOCUS_STEPS);
+        }
+
+        if (zone == active_zone && step == active_step) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+        active_zone = zone;
+        active_step = step;
+
+        if (zone == 0) {
+            int32_t lines = s_exposure_steps[step];
+            queue_exposure(lines);
+            ESP_LOGI(TAG, "touch EXP step=%d lines=%" PRId32 " raw=%u,%u xy=%d,%d",
+                     step, lines, p.raw_x, p.raw_y, p.x, p.y);
+        } else if (zone == 1) {
+            queue_gain(step);
+            ESP_LOGI(TAG, "touch GAIN idx=%d raw=%u,%u xy=%d,%d",
+                     step, p.raw_x, p.raw_y, p.x, p.y);
+        } else {
+            int32_t code = FOCUS_CODE_1M +
+                           (step * (FOCUS_CODE_30CM - FOCUS_CODE_1M) +
+                            (FOCUS_STEPS - 1) / 2) / (FOCUS_STEPS - 1);
+            queue_focus(code);
+            ESP_LOGI(TAG, "touch FOCUS step=%d code=%" PRId32 " raw=%u,%u xy=%d,%d",
+                     step, code, p.raw_x, p.raw_y, p.x, p.y);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+static void apply_control_requests(int fd)
+{
+    control_requests_t req;
+
+    portENTER_CRITICAL(&s_control_lock);
+    req = s_control_requests;
+    memset(&s_control_requests, 0, sizeof(s_control_requests));
+    portEXIT_CRITICAL(&s_control_lock);
+
+    if (req.exposure_pending || req.gain_pending) {
+        if (!s_manual_ae) {
+            esp_err_t ret = esp_video_isp_pipeline_set_agc_status(
+                ESP_VIDEO_ISP_PIPELINE_AGC_DISABLE);
+            if (ret == ESP_OK) {
+                s_manual_ae = true;
+                ESP_LOGI(TAG, "manual exposure/gain takeover: AE/AGC disabled; AWB unchanged");
+            } else {
+                ESP_LOGE(TAG, "failed to disable AE/AGC: %s", esp_err_to_name(ret));
+            }
+        }
+
+        if (req.exposure_pending &&
+            !write_user_ctrl(fd, V4L2_CID_EXPOSURE, req.exposure_lines)) {
+            ESP_LOGE(TAG, "setting exposure=%" PRId32 " failed errno=%d",
+                     req.exposure_lines, errno);
+        }
+        if (req.gain_pending &&
+            !write_user_ctrl(fd, V4L2_CID_GAIN, req.gain_index)) {
+            ESP_LOGE(TAG, "setting gain_idx=%" PRId32 " failed errno=%d",
+                     req.gain_index, errno);
+        }
+    }
+
+    if (req.focus_pending) {
+        s_manual_focus = true;
+        s_manual_focus_code = req.focus_code;
+        ESP_LOGI(TAG, "manual focus takeover: holding code=%" PRId32,
+                 s_manual_focus_code);
+    }
+
+    /*
+     * esp_video currently has a public runtime switch for AGC but not for AF.
+     * Once the focus slider is touched, reassert the chosen VCM position every
+     * capture cycle so any later IPA AF update cannot retain control of the lens.
+     */
+    if (s_manual_focus && !write_focus_ctrl(fd, s_manual_focus_code)) {
+        ESP_LOGE(TAG, "holding focus=%" PRId32 " failed errno=%d",
+                 s_manual_focus_code, errno);
+    }
+}
+
 static int preview_acquire_write_buffer(void)
 {
     int index = -1;
@@ -158,20 +361,13 @@ static int preview_acquire_write_buffer(void)
 static void preview_publish(int index)
 {
     portENTER_CRITICAL(&s_preview_lock);
-    if (s_latest_preview >= 0) {
-        ++s_dropped_previews;
-    }
+    if (s_latest_preview >= 0) ++s_dropped_previews;
     s_latest_preview = index;
     portEXIT_CRITICAL(&s_preview_lock);
 
     xTaskNotifyGive(s_display_task);
 }
 
-/*
- * LCD is deliberately downstream of camera capture. It consumes only the
- * newest completed preview frame. If capture/PPA outruns SPI, older pending
- * previews are dropped rather than back-pressuring CSI/ISP/IPA.
- */
 static void display_task(void *arg)
 {
     (void)arg;
@@ -188,9 +384,7 @@ static void display_task(void *arg)
         }
         portEXIT_CRITICAL(&s_preview_lock);
 
-        if (index < 0) {
-            continue;
-        }
+        if (index < 0) continue;
 
         esp_err_t ret = display_draw_preview(s_preview[index]);
         if (ret != ESP_OK) {
@@ -205,11 +399,27 @@ static void display_task(void *arg)
     }
 }
 
-/*
- * PPA may hold the camera buffer while it reads it, but only for the hardware
- * scale/rotate/mirror operation. The expensive SPI LCD transfer happens later
- * from a separate preview buffer in display_task().
- */
+static void add_preview_border(uint16_t *out)
+{
+    const uint16_t white = 0xffff;
+
+    for (int y = 0; y < ICG_PREVIEW_HEIGHT; ++y) {
+        for (int x = 0; x < PREVIEW_BORDER_PIXELS; ++x) {
+            out[(size_t)y * ICG_LCD_WIDTH + x] = white;
+            out[(size_t)y * ICG_LCD_WIDTH + (ICG_LCD_WIDTH - 1 - x)] = white;
+        }
+    }
+
+    for (int y = 0; y < PREVIEW_BORDER_PIXELS; ++y) {
+        uint16_t *top = out + (size_t)y * ICG_LCD_WIDTH;
+        uint16_t *bottom = out + (size_t)(ICG_PREVIEW_HEIGHT - 1 - y) * ICG_LCD_WIDTH;
+        for (int x = 0; x < ICG_LCD_WIDTH; ++x) {
+            top[x] = white;
+            bottom[x] = white;
+        }
+    }
+}
+
 static esp_err_t scale_preview_frame(const uint8_t *frame, uint32_t width,
                                      uint32_t height, size_t len, uint16_t *out)
 {
@@ -313,8 +523,9 @@ static esp_err_t run_preview(int fd)
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "live preview started: capture/3A decoupled from LCD; crop=%dx%d scale=5/16 rotation=180 mirror_x=1",
+    ESP_LOGI(TAG, "live preview started: full-screen crop=%dx%d -> 480x320; 2px edge border",
              PREVIEW_CROP_WIDTH, PREVIEW_CROP_HEIGHT);
+    ESP_LOGI(TAG, "touch zones: left=exposure centre=gain right=focus; bottom=min top=max");
     uint32_t frames = 0;
 
     while (true) {
@@ -342,7 +553,7 @@ static esp_err_t run_preview(int fd)
                                             fmt.fmt.pix.height, b.bytesused,
                                             s_preview[preview_index]);
 
-        /* Camera buffer is no longer needed after PPA finishes reading it. */
+        /* Camera source buffer is free immediately after PPA has consumed it. */
         if (ioctl(fd, VIDIOC_QBUF, &b) != 0) {
             ESP_LOGE(TAG, "VIDIOC_QBUF failed: errno=%d", errno);
             break;
@@ -353,6 +564,8 @@ static esp_err_t run_preview(int fd)
             break;
         }
 
+        add_preview_border(s_preview[preview_index]);
+        apply_control_requests(fd);
         preview_publish(preview_index);
 
         ++frames;
@@ -363,10 +576,11 @@ static esp_err_t run_preview(int fd)
             bool gain_ok = read_user_ctrl(fd, V4L2_CID_GAIN, &gain_index);
 
             if (exposure_ok && gain_ok) {
-                ESP_LOGI(TAG, "AE readback: exposure=%" PRId32 " gain_idx=%" PRId32,
-                         exposure_lines, gain_index);
+                ESP_LOGI(TAG, "sensor readback: exposure=%" PRId32 " gain_idx=%" PRId32
+                         " mode=%s",
+                         exposure_lines, gain_index, s_manual_ae ? "manual" : "auto");
             } else {
-                ESP_LOGW(TAG, "AE readback failed: exposure=%d gain=%d errno=%d",
+                ESP_LOGW(TAG, "sensor readback failed: exposure=%d gain=%d errno=%d",
                          exposure_ok, gain_ok, errno);
             }
         }
@@ -387,7 +601,7 @@ static esp_err_t run_preview(int fd)
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "IMX708 -> ISP/IPA/AF -> PPA -> decoupled ILI9488 preview");
+    ESP_LOGI(TAG, "IMX708 -> ISP/IPA/AF -> PPA -> full-screen ILI9488 preview");
 
     ESP_ERROR_CHECK(display_init());
     ESP_ERROR_CHECK(camera_power_on());
@@ -416,6 +630,16 @@ void app_main(void)
                     DISPLAY_TASK_PRIORITY, &s_display_task) != pdPASS) {
         ESP_LOGE(TAG, "display task creation failed");
         return;
+    }
+
+    esp_err_t touch_ret = touch_init();
+    if (touch_ret == ESP_OK) {
+        if (xTaskCreate(touch_task, "touch", TOUCH_TASK_STACK, NULL,
+                        TOUCH_TASK_PRIORITY, NULL) != pdPASS) {
+            ESP_LOGE(TAG, "touch task creation failed");
+        }
+    } else {
+        ESP_LOGE(TAG, "touch init failed: %s; preview will continue", esp_err_to_name(touch_ret));
     }
 
     int fd = open(ESP_VIDEO_MIPI_CSI_DEVICE_NAME, O_RDONLY);
