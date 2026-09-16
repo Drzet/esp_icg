@@ -2,6 +2,7 @@ idf_component_register(
     SRCS
         "imx708_test.c"
         "display.c"
+        "touch.c"
     INCLUDE_DIRS "."
     REQUIRES
         esp_video
