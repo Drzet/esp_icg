@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - test/imx708-author-snapshot-idf54
+      - feature/imx708-live-preview-idf54
   pull_request:
   workflow_dispatch:
 
@@ -41,7 +42,7 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: imx708-author-snapshot-idf54
+          name: imx708-live-preview-idf54
           path: |
             build/*.bin
             build/*.elf
