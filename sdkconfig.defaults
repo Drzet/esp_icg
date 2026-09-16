@@ -25,10 +25,12 @@ CONFIG_CAMERA_IMX708_MIPI_IF_FORMAT_INDEX_DEFAULT=0
 CONFIG_CAMERA_OV5647=n
 CONFIG_CAMERA_IMX219=n
 
-# Fixed-focus module: no lens actuator or autofocus stack.
+# Keep the DW9807 exposed through esp_video so V4L2_CID_FOCUS_ABSOLUTE works,
+# but do not let the IPA pipeline write its AF result into the motor. The AF
+# algorithm may still compute a result; manual focus owns the actuator.
 CONFIG_CAM_MOTOR_DW9807=y
 CONFIG_ESP_IPA_AF_ALGORITHM=y
 CONFIG_ESP_VIDEO_ENABLE_CAMERA_MOTOR_CONTROLLER=y
-CONFIG_ESP_VIDEO_ISP_PIPELINE_CONTROL_CAMERA_MOTOR=y
+CONFIG_ESP_VIDEO_ISP_PIPELINE_CONTROL_CAMERA_MOTOR=n
 
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
