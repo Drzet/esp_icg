@@ -44,6 +44,9 @@
 #define TOUCH_ZONE_HEIGHT      102
 #define TOUCH_ZONE_GAP         7
 
+/* Last 10% of exposure/gain slider travel is a hard maximum plateau. */
+#define SENSITIVITY_MAX_PLATEAU_X  ((ICG_LCD_WIDTH * 90) / 100)
+
 /* Manual focus guard range for the standard ~75-degree Camera Module 3 lens. */
 #define FOCUS_CODE_1M          477
 #define FOCUS_CODE_30CM        552
@@ -68,14 +71,15 @@ static volatile uint32_t s_display_frames;
 static volatile uint32_t s_dropped_previews;
 
 /*
- * Exposure slider uses roughly one-third-stop spacing. The sensor accepts any
- * even line count in this range, but logarithmic steps give useful control at
- * both the short and long ends instead of wasting most of the slider travel.
+ * Fluorescence-oriented manual exposure range. Values below 512 lines are not
+ * useful here, so the full slider travel is spent on 512..2624. The final
+ * value is handled as a deliberately wide maximum plateau.
  */
 static const uint16_t s_exposure_steps[] = {
-    4, 6, 8, 10, 12, 16, 20, 26, 32, 40,
-    50, 64, 80, 102, 128, 162, 204, 256, 322, 406,
-    512, 646, 812, 1024, 1290, 1626, 2048, 2580, 2624,
+    512, 576, 640, 704, 768, 832, 896, 960,
+    1024, 1120, 1216, 1312, 1408, 1504, 1600, 1696,
+    1792, 1888, 1984, 2080, 2176, 2272, 2368, 2464,
+    2560, 2624,
 };
 
 /* Requests are produced by touch_task and consumed between captured frames. */
@@ -206,6 +210,21 @@ static int slider_step_from_x(int x, int count)
            (ICG_LCD_WIDTH - 1);
 }
 
+static int sensitivity_step_from_x(int x, int count)
+{
+    if (x < 0) x = 0;
+    if (x >= ICG_LCD_WIDTH) x = ICG_LCD_WIDTH - 1;
+
+    if (x >= SENSITIVITY_MAX_PLATEAU_X) {
+        return count - 1;
+    }
+
+    /* Spread all non-maximum steps over the first 90% of slider travel. */
+    const int non_max_steps = count - 1;
+    return (x * (non_max_steps - 1) + (SENSITIVITY_MAX_PLATEAU_X - 1) / 2) /
+           (SENSITIVITY_MAX_PLATEAU_X - 1);
+}
+
 static void queue_exposure(int32_t lines)
 {
     portENTER_CRITICAL(&s_control_lock);
@@ -253,9 +272,10 @@ static void touch_task(void *arg)
 
         int step;
         if (zone == 0) {
-            step = slider_step_from_x(p.x, (int)(sizeof(s_exposure_steps) / sizeof(s_exposure_steps[0])));
+            step = sensitivity_step_from_x(
+                p.x, (int)(sizeof(s_exposure_steps) / sizeof(s_exposure_steps[0])));
         } else if (zone == 1) {
-            step = slider_step_from_x(p.x, 47);
+            step = sensitivity_step_from_x(p.x, 47);
         } else {
             step = slider_step_from_x(p.x, FOCUS_STEPS);
         }
