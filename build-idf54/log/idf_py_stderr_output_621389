@@ -1,0 +1,15 @@
+Command: cmake -G Ninja -B /home/zet/esp/projects/esp_icg/build-idf54 -DPYTHON_DEPS_CHECKED=1 -DPYTHON=/home/zet/.espressif/tools/python/76f5ded/venv/bin/python -DESP_PLATFORM=1 -DSDKCONFIG=sdkconfig.idf54 -DCCACHE_ENABLE=False /home/zet/esp/projects/esp_icg
+CMake Error at /home/zet/esp/esp-idf/tools/cmake/build.cmake:697 (message):
+  ERROR: Version solving failed:
+
+      - no versions of idf match 5.4.0
+      - project depends on idf (5.4.0)
+
+  Result: Because project depends on idf (5.4.0) which doesn't match any
+  versions, version solving failed.
+
+Call Stack (most recent call first):
+  /home/zet/esp/esp-idf/tools/cmake/project.cmake:773 (idf_build_process)
+  CMakeLists.txt:22 (project)
+
+
