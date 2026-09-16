@@ -110,6 +110,30 @@ static esp_err_t camera_power_on(void)
 }
 
 /*
+ * Exposure and gain are USER-class controls on the camera video node. Reading
+ * them back while streaming tells us whether IPA/AE is actually commanding the
+ * sensor, independently of what the preview looks like.
+ */
+static bool read_user_ctrl(int fd, uint32_t id, int32_t *out)
+{
+    struct v4l2_ext_control ctrl = {
+        .id = id,
+    };
+    struct v4l2_ext_controls ctrls = {
+        .ctrl_class = V4L2_CTRL_CLASS_USER,
+        .count = 1,
+        .controls = &ctrl,
+    };
+
+    if (ioctl(fd, VIDIOC_G_EXT_CTRLS, &ctrls) != 0) {
+        return false;
+    }
+
+    *out = ctrl.value;
+    return true;
+}
+
+/*
  * Pick a preview buffer that is neither being transmitted to the LCD nor the
  * newest frame waiting for the LCD. With three buffers there is always one
  * available: display-busy, latest-pending, and capture-write can all be
@@ -332,6 +356,21 @@ static esp_err_t run_preview(int fd)
         preview_publish(preview_index);
 
         ++frames;
+        if ((frames % 20) == 0) {
+            int32_t exposure_lines = -1;
+            int32_t gain_index = -1;
+            bool exposure_ok = read_user_ctrl(fd, V4L2_CID_EXPOSURE, &exposure_lines);
+            bool gain_ok = read_user_ctrl(fd, V4L2_CID_GAIN, &gain_index);
+
+            if (exposure_ok && gain_ok) {
+                ESP_LOGI(TAG, "AE readback: exposure=%" PRId32 " gain_idx=%" PRId32,
+                         exposure_lines, gain_index);
+            } else {
+                ESP_LOGW(TAG, "AE readback failed: exposure=%d gain=%d errno=%d",
+                         exposure_ok, gain_ok, errno);
+            }
+        }
+
         if ((frames % 100) == 0) {
             ESP_LOGI(TAG, "capture frames=%" PRIu32 " display=%" PRIu32
                      " dropped_preview=%" PRIu32 " bytes=%" PRIu32,
