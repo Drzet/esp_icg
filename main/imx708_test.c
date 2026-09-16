@@ -13,7 +13,6 @@
 #include "esp_log.h"
 #include "esp_video_device.h"
 #include "esp_video_init.h"
-#include "esp_video_isp_ioctl.h"
 #include "esp_video_isp_pipeline.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -25,10 +24,6 @@
 
 #if CONFIG_ESP_VIDEO_ISP_PIPELINE_CONTROL_CAMERA_MOTOR
 #error "Manual focus requires CONFIG_ESP_VIDEO_ISP_PIPELINE_CONTROL_CAMERA_MOTOR=n; regenerate sdkconfig from sdkconfig.defaults (idf.py set-target esp32p4)."
-#endif
-
-#if CONFIG_ESP_IPA_AWB_ALGORITHM
-#error "Fixed white balance requires CONFIG_ESP_IPA_AWB_ALGORITHM=n; regenerate sdkconfig from sdkconfig.defaults (idf.py set-target esp32p4)."
 #endif
 
 #define CAMERA_POWER_GPIO      0
@@ -176,34 +171,6 @@ static bool write_user_ctrl(int fd, uint32_t id, int32_t value)
         .controls = &ctrl,
     };
     return ioctl(fd, VIDIOC_S_EXT_CTRLS, &ctrls) == 0;
-}
-
-static esp_err_t set_fixed_white_balance(void)
-{
-    int isp_fd = open(ESP_VIDEO_ISP1_DEVICE_NAME, O_RDWR);
-    if (isp_fd < 0) {
-        ESP_LOGE(TAG, "open %s for fixed WB failed: errno=%d",
-                 ESP_VIDEO_ISP1_DEVICE_NAME, errno);
-        return ESP_FAIL;
-    }
-
-    bool red_ok = write_user_ctrl(isp_fd, V4L2_CID_RED_BALANCE,
-                                  V4L2_CID_RED_BALANCE_DEN);
-    int red_errno = errno;
-    bool blue_ok = write_user_ctrl(isp_fd, V4L2_CID_BLUE_BALANCE,
-                                   V4L2_CID_BLUE_BALANCE_DEN);
-    int blue_errno = errno;
-
-    close(isp_fd);
-
-    if (!red_ok || !blue_ok) {
-        ESP_LOGE(TAG, "fixed WB failed: red=%d errno=%d blue=%d errno=%d",
-                 red_ok, red_errno, blue_ok, blue_errno);
-        return ESP_FAIL;
-    }
-
-    ESP_LOGI(TAG, "fixed white balance: R=1.000 G=1.000 B=1.000");
-    return ESP_OK;
 }
 
 static bool write_focus_ctrl(int fd, int32_t value)
@@ -355,7 +322,7 @@ static void apply_control_requests(int fd)
                 ESP_VIDEO_ISP_PIPELINE_AGC_DISABLE);
             if (ret == ESP_OK) {
                 s_manual_ae = true;
-                ESP_LOGI(TAG, "manual exposure/gain takeover: AE/AGC disabled; fixed WB unchanged");
+                ESP_LOGI(TAG, "manual exposure/gain takeover: AE/AGC disabled; AWB unchanged");
             } else {
                 ESP_LOGE(TAG, "failed to disable AE/AGC: %s", esp_err_to_name(ret));
             }
@@ -547,7 +514,6 @@ static esp_err_t run_preview(int fd)
              PREVIEW_CROP_WIDTH, PREVIEW_CROP_HEIGHT);
     ESP_LOGI(TAG, "touch bands: top=exposure middle=gain bottom=focus; left=min right=max");
     ESP_LOGI(TAG, "manual focus: IPA motor writes disabled; direct DW9807 control only");
-    ESP_LOGI(TAG, "white balance: fixed unity gains; IPA AWB disabled");
     uint32_t frames = 0;
 
     while (true) {
@@ -631,7 +597,6 @@ void app_main(void)
                                               ESP_VIDEO_INIT_FLAGS_MIPI_CSI |
                                               ESP_VIDEO_INIT_FLAGS_ISP |
                                               ESP_VIDEO_INIT_FLAGS_MOTOR));
-    ESP_ERROR_CHECK(set_fixed_white_balance());
 
     ppa_client_config_t ppa_cfg = {
         .oper_type = PPA_OPERATION_SRM,
