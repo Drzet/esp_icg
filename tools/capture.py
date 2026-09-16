@@ -1,0 +1,373 @@
+#!/usr/bin/env python3
+"""Flash the board and/or receive captured frames from it over the serial link.
+
+The port can only have one owner. `idf.py monitor` holds it, so a monitor left
+running in another terminal makes `idf.py flash` fail with "Access is denied" -
+and a monitor cannot extract a binary payload anyway, since it mangles the bytes
+it prints. This script is the single owner: it flashes (optionally), resets the
+board, captures the stream, and pulls the images out of it.
+
+Run it from anywhere; it works out which project to flash:
+
+    # from the repo root - defaults to the imx708_snapshot example
+    python tools/capture.py --flash
+
+    # from inside any example directory
+    python ../../tools/capture.py --flash
+
+    # or point at a project explicitly, from anywhere
+    python tools/capture.py --flash --project components/esp_cam_sensor_imx/examples/imx708_snapshot
+
+    python tools/capture.py --seconds 400 --out sweep   # a FOCUS_SWEEP run
+
+Frames and logs are written to <repo>/captures/<--out>, wherever the script was
+run from. That directory is in .gitignore, so a debug capture never turns up as
+something to decide about committing. Pass an absolute --out to put them
+elsewhere.
+
+    # imx708_video: 6 s aiming, 8 s recording, then a couple of MB to shift
+    python tools/capture.py --flash --project components/esp_cam_sensor_imx/examples/imx708_video --out clip
+
+Payloads are framed in the stream as:
+
+    IMGSTART name=<n> fmt=<jpeg|rgb565|h264> w=<w> h=<h> len=<N> crc32=<hex> [k=v ...]
+    <exactly N raw bytes>
+    IMGEND
+
+Trailing key=value pairs are per-format extras (video adds fps=, frames=, ms=);
+unknown keys are ignored, so an old receiver still reads a new sender's frames.
+
+JPEG frames are written as .jpg. Raw RGB565 frames are written as .bmp so they
+can be opened directly - the sweep produces raw specifically because JPEG is
+lossy enough to distort a sharpness measurement (~18% on this metric), but a
+.raw file nobody can open is not much use either. H.264 is written as both the
+raw .h264 elementary stream and a .mp4 muxed around it, because an Annex-B
+stream is not a container and most players will not touch one.
+"""
+import argparse
+import os
+import re
+import struct
+import shutil
+import subprocess
+import sys
+import time
+import zlib
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import mp4
+
+try:
+    import serial
+except ImportError:
+    sys.exit("pyserial not found. Run this with ESP-IDF's python, which has it:\n"
+             "  ~/.espressif/python_env/idf5.4_py3.11_env/Scripts/python.exe tools/capture.py")
+
+HDR = re.compile(rb'IMGSTART name=(\S+) fmt=(\S+) w=(\d+) h=(\d+) len=(\d+) crc32=([0-9a-f]+)([^\n]*)\n')
+VIDFRAME = re.compile(rb'VIDFRAME i=(\d+) t=(\d+) off=(\d+) len=(\d+) type=(\w+)\r?\n')
+DONE_MARK = b'==== done'
+MODE_PROMPT = b'MODESEL> '
+
+
+def echo_console(buf, pos, out=sys.stdout):
+    """Print console text as it arrives, stepping over binary payloads."""
+    skip = 0
+    while True:
+        m = HDR.search(buf, pos)
+        if m:
+            out.write(buf[pos:m.end()].decode('utf-8', 'replace'))
+            pos, skip = m.end(), int(m.group(5))
+            have = min(skip, len(buf) - pos)
+            pos, skip = pos + have, skip - have
+            if skip:
+                break
+            continue
+        tail = buf.rfind(b'IMGSTART', pos)
+        end = tail if tail != -1 else len(buf)
+        if end > pos:
+            out.write(buf[pos:end].decode('utf-8', 'replace'))
+            pos = end
+        break
+    out.flush()
+    return pos, skip
+
+
+def read_keypress():
+    """One keystroke, or None if nobody has pressed anything yet."""
+    try:
+        try:
+            import msvcrt
+        except ImportError:
+            import select
+            if select.select([sys.stdin], [], [], 0)[0]:
+                return sys.stdin.read(1).encode()
+            return None
+        if msvcrt.kbhit():
+            return msvcrt.getch()
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def is_project(d):
+    """An ESP-IDF project is a directory whose CMakeLists.txt calls project()."""
+    cml = os.path.join(d, 'CMakeLists.txt')
+    if not os.path.isfile(cml):
+        return False
+    try:
+        with open(cml, encoding='utf-8', errors='replace') as f:
+            return re.search(r'^\s*project\s*\(', f.read(), re.M) is not None
+    except OSError:
+        return False
+
+
+def resolve_project(explicit):
+    """Which project to flash: what was asked for, else the CWD, else the default."""
+    if explicit:
+        d = os.path.abspath(explicit)
+        if not is_project(d):
+            sys.exit(f'{d} does not look like an ESP-IDF project '
+                     '(no CMakeLists.txt with a project() call).')
+        return d
+    cwd = os.getcwd()
+    if is_project(cwd):
+        return cwd
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    default = os.path.join(repo, 'components', 'esp_cam_sensor_imx', 'examples', 'imx708_snapshot')
+    return default if is_project(default) else None
+
+
+def resolve_out(out):
+    """Where captured frames go: <repo>/captures/<out>, wherever this was run."""
+    if os.path.isabs(out):
+        return out
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(repo, 'captures', out)
+
+
+def rgb565_to_bmp(payload, w, h, path):
+    """Expand RGB565 (LE) to a 24-bit BMP. BMP rows are stored bottom-up."""
+    row_bytes = w * 3
+    pad = (-row_bytes) % 4
+    img_bytes = (row_bytes + pad) * h
+    hdr = bytearray(54)
+    hdr[0:2] = b'BM'
+    struct.pack_into('<I', hdr, 2, 54 + img_bytes)
+    struct.pack_into('<I', hdr, 10, 54)
+    struct.pack_into('<I', hdr, 14, 40)
+    struct.pack_into('<i', hdr, 18, w)
+    struct.pack_into('<i', hdr, 22, h)
+    struct.pack_into('<H', hdr, 26, 1)
+    struct.pack_into('<H', hdr, 28, 24)
+    struct.pack_into('<I', hdr, 34, img_bytes)
+    with open(path, 'wb') as f:
+        f.write(hdr)
+        padding = b'\0' * pad
+        for y in range(h - 1, -1, -1):
+            src = payload[y * w * 2:(y + 1) * w * 2]
+            row = bytearray(row_bytes)
+            for x in range(w):
+                px = src[2 * x] | (src[2 * x + 1] << 8)
+                r5, g6, b5 = (px >> 11) & 0x1f, (px >> 5) & 0x3f, px & 0x1f
+                row[3 * x + 0] = (b5 << 3) | (b5 >> 2)
+                row[3 * x + 1] = (g6 << 2) | (g6 >> 4)
+                row[3 * x + 2] = (r5 << 3) | (r5 >> 2)
+            f.write(row)
+            if pad:
+                f.write(padding)
+
+
+def parse_extra(raw):
+    """Trailing 'k=v k=v' fields of a frame header, as a dict of str -> str."""
+    out = {}
+    for tok in raw.decode('ascii', 'replace').split():
+        if '=' in tok:
+            k, v = tok.split('=', 1)
+            out[k] = v
+    return out
+
+
+def parse_frame_table(buf, expect):
+    """Capture timestamps, in ms, from the VIDFRAME lines the board prints."""
+    ts = [(int(m.group(1)), int(m.group(2))) for m in VIDFRAME.finditer(buf)]
+    if not ts or (expect is not None and len(ts) != expect):
+        return None
+    if [i for i, _ in ts] != list(range(len(ts))):
+        return None
+    return [t for _, t in ts]
+
+
+def write_h264(payload, path, extra, buf, notes):
+    """Write the elementary stream, and an .mp4 around it if it can be muxed."""
+    with open(path, 'wb') as f:
+        f.write(payload)
+    try:
+        fps = float(extra.get('fps', 0)) or 28.0
+    except ValueError:
+        fps = 28.0
+    frames = int(extra['frames']) if extra.get('frames', '').isdigit() else None
+    ts = parse_frame_table(buf, frames)
+    mp4_path = os.path.splitext(path)[0] + '.mp4'
+    durations = mp4.durations_from_timestamps(ts, fallback_fps=fps) if ts else None
+    data = None
+    for attempt in ((durations, None) if durations else (None,)):
+        try:
+            data = mp4.build_mp4(payload, durations=attempt, fps=fps)
+        except Exception as e:
+            notes.append(f'{os.path.basename(path)}: {e}')
+            continue
+        timing = 'capture timestamps' if attempt else f'a nominal {fps:g} fps'
+        notes.append(f'muxed {len(data)} bytes -> {mp4_path}, timed from {timing}')
+        break
+    if data is None:
+        return path
+    with open(mp4_path, 'wb') as f:
+        f.write(data)
+    return mp4_path
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--port', default='COM3')
+    ap.add_argument('--baud', type=int, default=2000000,
+                    help='must match CONFIG_ESP_CONSOLE_UART_BAUDRATE (default 2000000)')
+    ap.add_argument('--seconds', type=float, default=90.0,
+                    help='ceiling on how long to listen. Capture stops as soon as the '
+                         'board reports it is done, so this only matters when a run '
+                         'never gets there; a sweep needs ~25 s per position.')
+    ap.add_argument('--out', default='capture',
+                    help='output directory name, created under <repo>/captures/ '
+                         '(which .gitignore already covers). An absolute path is '
+                         'used as given.')
+    ap.add_argument('--flash', action='store_true', help='run idf.py flash first')
+    ap.add_argument('--project', default=None,
+                    help='ESP-IDF project to flash. Defaults to the current directory '
+                         'when it is a project, else the imx708_snapshot example.')
+    ap.add_argument('--keep-raw', action='store_true',
+                    help='also keep the undecoded .raw payload alongside the .bmp')
+    ap.add_argument('--keys', default=None,
+                    help='drive a MODE_CONSOLE build without typing: a sequence like '
+                         '"4,2,q" sent one keystroke per prompt. The board takes ~7 s '
+                         'per capture, so the send waits for the prompt rather than '
+                         'guessing at delays. Digits capture a mode; h/v/n set the '
+                         'flips; d and b step the exposure a stop darker or brighter '
+                         'than AE and a returns it to auto (they alias - and +, which '
+                         'argparse would read as an option here).')
+    ap.add_argument('--interactive', action='store_true',
+                    help='forward your keystrokes to a MODE_CONSOLE build and echo the '
+                         'board back, so modes can be picked by hand while it runs.')
+    args = ap.parse_args()
+    project = resolve_project(args.project)
+    if args.flash:
+        if not project:
+            sys.exit('No ESP-IDF project found. Run this from a project directory '
+                     'or pass --project <dir>.')
+        print(f'--- flashing {project} on {args.port} ---')
+        exe = shutil.which('idf.py')
+        if exe and os.path.splitext(exe)[1].lower() in ('.exe', '.bat', '.cmd'):
+            cmd = [exe]
+        else:
+            idf_path = os.environ.get('IDF_PATH')
+            if not idf_path:
+                sys.exit('IDF_PATH is not set - run this from an activated ESP-IDF shell.')
+            cmd = [sys.executable, os.path.join(idf_path, 'tools', 'idf.py')]
+        r = subprocess.run(cmd + ['-p', args.port, 'flash'], cwd=project)
+        if r.returncode != 0:
+            sys.exit('flash failed. Is a serial monitor still holding the port?')
+    args.out = resolve_out(args.out)
+    os.makedirs(args.out, exist_ok=True)
+    print(f'--- writing to {args.out} ---')
+    s = serial.Serial(args.port, args.baud, timeout=0.05)
+    try:
+        s.set_buffer_size(rx_size=1 << 20)
+    except Exception:
+        pass
+    s.dtr = False
+    s.rts = True
+    time.sleep(0.15)
+    s.rts = False
+    keys = [k.strip() for k in args.keys.split(',')] if args.keys else []
+    if args.interactive:
+        print('--- interactive: press 0-4 for a mode, q to finish ---')
+    print(f'--- listening on {args.port} at {args.baud} for up to {args.seconds:.0f}s ---')
+    buf = bytearray()
+    echo_pos, echo_skip = 0, 0
+    prompts_answered = 0
+    t0 = time.time()
+    while time.time() - t0 < args.seconds:
+        d = s.read(65536)
+        if d:
+            buf += d
+            if args.interactive:
+                if echo_skip:
+                    have = min(echo_skip, len(buf) - echo_pos)
+                    echo_pos, echo_skip = echo_pos + have, echo_skip - have
+                if not echo_skip:
+                    echo_pos, echo_skip = echo_console(buf, echo_pos)
+            if DONE_MARK in d or DONE_MARK in buf[-len(d) - 32:]:
+                print(f'--- board reported done after {time.time() - t0:.1f}s ---')
+                break
+            if keys and buf.count(MODE_PROMPT) > prompts_answered:
+                k = keys.pop(0)
+                prompts_answered += 1
+                print(f'--- sending {k!r} ---')
+                s.write(k.encode())
+        if args.interactive:
+            k = read_keypress()
+            if k:
+                s.write(k)
+    s.close()
+    images, notes, pos = [], [], 0
+    while True:
+        m = HDR.search(buf, pos)
+        if not m:
+            break
+        name, fmt = m.group(1).decode(), m.group(2).decode()
+        w, h, ln = int(m.group(3)), int(m.group(4)), int(m.group(5))
+        crc = int(m.group(6), 16)
+        extra = parse_extra(m.group(7))
+        start = m.end()
+        payload = bytes(buf[start:start + ln])
+        got = zlib.crc32(payload) & 0xffffffff
+        ok = len(payload) == ln and got == crc
+        if fmt == 'jpeg':
+            path = os.path.join(args.out, f'{name}.jpg')
+            open(path if ok else path + '.bad', 'wb').write(payload)
+        elif fmt == 'h264':
+            path = os.path.join(args.out, f'{name}.h264')
+            if ok:
+                path = write_h264(payload, path, extra, buf[:m.start()], notes)
+            else:
+                open(path + '.bad', 'wb').write(payload)
+        else:
+            path = os.path.join(args.out, f'{name}.bmp')
+            if ok:
+                rgb565_to_bmp(payload, w, h, path)
+            if args.keep_raw or not ok:
+                open(os.path.join(args.out, f'{name}.raw'), 'wb').write(payload)
+        images.append((name, fmt, w, h, ln, len(payload), crc, got, ok, path))
+        pos = start + ln
+    text, pos = bytearray(), 0
+    for m in HDR.finditer(buf):
+        text += buf[pos:m.start()]
+        pos = m.end() + int(m.group(5))
+    text += buf[pos:]
+    log = text.decode('utf-8', 'replace')
+    open(os.path.join(args.out, 'log.txt'), 'w', encoding='utf-8', newline='').write(log)
+    print(f'--- {len(buf)} bytes captured ---')
+    for name, fmt, w, h, ln, got_len, crc, got, ok, path in images:
+        flag = 'OK ' if ok else 'BAD'
+        print(f'  [{flag}] {name:14s} {fmt:6s} {w}x{h} {ln} bytes '
+              f'crc {crc:08x}/{got:08x} -> {path}')
+    for note in notes:
+        print(f'  {note}')
+    if not images:
+        print('  no images in the stream. Wrong --baud, or the run had not finished?')
+    for line in log.splitlines()[-15:]:
+        if not line.startswith('VIDFRAME'):
+            print(line)
+
+
+if __name__ == '__main__':
+    main()
