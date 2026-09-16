@@ -1,0 +1,12 @@
+{
+  "idf.customExtraVars": {},
+  "clangd.path": "/home/zet/.espressif/tools/esp-clang/esp-18.1.2_20240912/esp-clang/bin/clangd",
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=**",
+    "--compile-commands-dir=/home/zet/esp/projects/esp_icg/build"
+  ],
+  "idf.currentSetup": "/home/zet/esp/esp-idf",
+  "idf.flashType": "JTAG",
+  "idf.port": "/dev/ttyACM0"
+}
