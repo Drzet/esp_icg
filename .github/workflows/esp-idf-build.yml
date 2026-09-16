@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - test/imx708-author-snapshot-idf54
   pull_request:
   workflow_dispatch:
 
@@ -11,7 +12,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     container:
-      image: espressif/idf:v6.0.3
+      image: espressif/idf:v5.4.0
 
     steps:
       - name: Checkout
@@ -30,7 +31,7 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: esp_icg-imx708-esp32p4
+          name: imx708-author-snapshot-idf54
           path: |
             build/*.bin
             build/*.elf
