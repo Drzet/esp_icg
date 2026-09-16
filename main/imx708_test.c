@@ -260,11 +260,10 @@ void app_main(void)
              esp_err_to_name(video_ret), (unsigned)video_ret);
     ESP_ERROR_CHECK(video_ret);
 
-    uint32_t min_exposure_us = 0;
-    esp_err_t ipa_probe = esp_video_isp_pipeline_get_agc_min_exposure(&min_exposure_us);
+    esp_video_isp_pipeline_agc_status_t agc_status;
+    esp_err_t ipa_probe = esp_video_isp_pipeline_get_agc_status(&agc_status);
     if (ipa_probe == ESP_OK) {
-        ESP_LOGI(TAG, "IPA controller probe: OK, AGC min exposure=%" PRIu32 " us",
-                 min_exposure_us);
+        ESP_LOGI(TAG, "IPA controller probe: OK, AGC status=%d", (int)agc_status);
     } else {
         ESP_LOGE(TAG, "IPA controller probe FAILED: %s (0x%x)",
                  esp_err_to_name(ipa_probe), (unsigned)ipa_probe);
