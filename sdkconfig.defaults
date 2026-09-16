@@ -1,34 +1,48 @@
+# Target
 CONFIG_IDF_TARGET="esp32p4"
-CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 
-# ESP32-P4 rev1 hardware support
-CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
-
-# Camera frame buffers need fast PSRAM
+# PSRAM — frame buffers + the BMP row work live off SPIRAM
 CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_HEX=y
+# 200 MHz PSRAM is gated behind the experimental-features flag; without it
+# the choice silently falls back to 20 MHz, which is far too slow to absorb
+# a full-rate camera frame and every capture comes back empty.
 CONFIG_IDF_EXPERIMENTAL_FEATURES=y
 CONFIG_SPIRAM_SPEED_200M=y
-CONFIG_SPIRAM_USE_CAPS_ALLOC=y
+
+# DMA writes to PSRAM go through L2. The 128 KB / 64-byte-line default turns the
+# camera's stream into short bursts; 256 KB with 128-byte lines lets the DMA
+# drain in half as many, larger PSRAM transactions.
 CONFIG_CACHE_L2_CACHE_256KB=y
 CONFIG_CACHE_L2_CACHE_LINE_128B=y
 
-# IMX708: CSI + hardware ISP with IPA pipeline control for AE/AGC/AWB.
-# CMake replaces esp_ipa 2.3's rev1-incompatible prebuilt archive with the
-# rev1-safe 2.2 archive before linking.
+# 32 MB flash on this board
+CONFIG_ESPTOOLPY_FLASHSIZE_32MB=y
+
+# esp_video: MIPI-CSI capture + ISP
 CONFIG_ESP_VIDEO_ENABLE_MIPI_CSI_VIDEO_DEVICE=y
 CONFIG_ESP_VIDEO_ENABLE_ISP_VIDEO_DEVICE=y
 CONFIG_ESP_VIDEO_ENABLE_ISP_PIPELINE_CONTROLLER=y
+
+# IMX708 driver + auto-detect
 CONFIG_CAMERA_IMX708=y
 CONFIG_CAMERA_IMX708_AUTO_DETECT_MIPI_INTERFACE_SENSOR=y
-CONFIG_CAMERA_IMX708_MIPI_IF_FORMAT_INDEX_DEFAULT=0
-
-# Explicitly disable sensors from the OV5647 prototype branch so a stale or
-# regenerated sdkconfig cannot probe the wrong camera first.
-CONFIG_CAMERA_OV5647=n
 CONFIG_CAMERA_IMX219=n
 
-# Fixed-focus module: no lens actuator or autofocus stack.
-CONFIG_CAM_MOTOR_DW9807=n
-CONFIG_ESP_IPA_AF_ALGORITHM=n
+# Autofocus. The VCM is a separate chip (DW9807 at I2C 0x0c) from the sensor,
+# so it needs its own driver enabled; CAM_MOTOR_DW9807 selects
+# CAMERA_MOTOR_DEVICE_USED, which is what lets the three symbols below turn on.
+CONFIG_CAM_MOTOR_DW9807=y
+CONFIG_CAM_MOTOR_DW9807_AUTO_DETECT=y
+CONFIG_ESP_IPA_AF_ALGORITHM=y
+CONFIG_ESP_VIDEO_ENABLE_CAMERA_MOTOR_CONTROLLER=y
+CONFIG_ESP_VIDEO_ISP_PIPELINE_CONTROL_CAMERA_MOTOR=y
+
+# FAT long filenames on the SD card
+CONFIG_FATFS_LFN_HEAP=y
 
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# Console baud used by the original snapshot example's serial image transport.
+CONFIG_ESP_CONSOLE_UART_CUSTOM=y
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=2000000
