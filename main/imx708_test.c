@@ -59,8 +59,31 @@ static const esp_video_init_csi_config_t s_csi_config[] = {
     },
 };
 
+/*
+ * The DW9807 autofocus VCM is a separate SCCB device from the IMX708 sensor.
+ * It must be registered independently so esp_video probes and exposes it to
+ * the ISP/IPA autofocus pipeline.
+ */
+static const esp_video_init_cam_motor_config_t s_motor_config[] = {
+    {
+        .sccb_config = {
+            .init_sccb = true,
+            .i2c_config = {
+                .port = CAMERA_SCCB_I2C_PORT,
+                .scl_pin = CAMERA_SCCB_SCL,
+                .sda_pin = CAMERA_SCCB_SDA,
+            },
+            .freq = CAMERA_SCCB_FREQ_HZ,
+        },
+        .reset_pin = -1,
+        .pwdn_pin = -1,
+        .signal_pin = -1,
+    },
+};
+
 static const esp_video_init_config_t s_video_config = {
     .csi = s_csi_config,
+    .cam_motor = s_motor_config,
 };
 
 static esp_err_t camera_power_on(void)
@@ -235,7 +258,8 @@ void app_main(void)
 
     ESP_ERROR_CHECK(esp_video_init_with_flags(&s_video_config,
                                               ESP_VIDEO_INIT_FLAGS_MIPI_CSI |
-                                              ESP_VIDEO_INIT_FLAGS_ISP));
+                                              ESP_VIDEO_INIT_FLAGS_ISP |
+                                              ESP_VIDEO_INIT_FLAGS_MOTOR));
 
     ppa_client_config_t ppa_cfg = {
         .oper_type = PPA_OPERATION_SRM,
