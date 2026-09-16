@@ -28,6 +28,9 @@
 #define CAMERA_BUFFER_COUNT    3
 #define PPA_CACHE_LINE_SIZE    128
 #define PREVIEW_BUFFER_SIZE    (ICG_LCD_WIDTH * ICG_PREVIEW_HEIGHT * sizeof(uint16_t))
+#define PREVIEW_BUFFER_COUNT   3
+#define DISPLAY_TASK_STACK     4096
+#define DISPLAY_TASK_PRIORITY  (tskIDLE_PRIORITY + 1)
 
 /*
  * ESP32-P4 PPA scale factors are quantized to 1/16 steps. 1920x1080 ->
@@ -41,7 +44,13 @@
 
 static const char *TAG = "imx708_preview";
 static ppa_client_handle_t s_ppa;
-static uint16_t *s_preview;
+static uint16_t *s_preview[PREVIEW_BUFFER_COUNT];
+static TaskHandle_t s_display_task;
+static portMUX_TYPE s_preview_lock = portMUX_INITIALIZER_UNLOCKED;
+static int s_latest_preview = -1;
+static int s_display_preview = -1;
+static volatile uint32_t s_display_frames;
+static volatile uint32_t s_dropped_previews;
 
 static const esp_video_init_csi_config_t s_csi_config[] = {
     {
@@ -100,9 +109,87 @@ static esp_err_t camera_power_on(void)
     return ESP_OK;
 }
 
-static esp_err_t preview_frame(const uint8_t *frame, uint32_t width, uint32_t height, size_t len)
+/*
+ * Pick a preview buffer that is neither being transmitted to the LCD nor the
+ * newest frame waiting for the LCD. With three buffers there is always one
+ * available: display-busy, latest-pending, and capture-write can all be
+ * different buffers.
+ */
+static int preview_acquire_write_buffer(void)
 {
-    if (!frame || len < (size_t)width * height * sizeof(uint16_t)) {
+    int index = -1;
+
+    portENTER_CRITICAL(&s_preview_lock);
+    for (int i = 0; i < PREVIEW_BUFFER_COUNT; ++i) {
+        if (i != s_display_preview && i != s_latest_preview) {
+            index = i;
+            break;
+        }
+    }
+    portEXIT_CRITICAL(&s_preview_lock);
+
+    return index;
+}
+
+static void preview_publish(int index)
+{
+    portENTER_CRITICAL(&s_preview_lock);
+    if (s_latest_preview >= 0) {
+        ++s_dropped_previews;
+    }
+    s_latest_preview = index;
+    portEXIT_CRITICAL(&s_preview_lock);
+
+    xTaskNotifyGive(s_display_task);
+}
+
+/*
+ * LCD is deliberately downstream of camera capture. It consumes only the
+ * newest completed preview frame. If capture/PPA outruns SPI, older pending
+ * previews are dropped rather than back-pressuring CSI/ISP/IPA.
+ */
+static void display_task(void *arg)
+{
+    (void)arg;
+
+    while (true) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        int index;
+        portENTER_CRITICAL(&s_preview_lock);
+        index = s_latest_preview;
+        if (index >= 0) {
+            s_latest_preview = -1;
+            s_display_preview = index;
+        }
+        portEXIT_CRITICAL(&s_preview_lock);
+
+        if (index < 0) {
+            continue;
+        }
+
+        esp_err_t ret = display_draw_preview(s_preview[index]);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "display failed: %s", esp_err_to_name(ret));
+        } else {
+            ++s_display_frames;
+        }
+
+        portENTER_CRITICAL(&s_preview_lock);
+        s_display_preview = -1;
+        portEXIT_CRITICAL(&s_preview_lock);
+    }
+}
+
+/*
+ * PPA may hold the camera buffer while it reads it, but only for the hardware
+ * scale/rotate/mirror operation. The expensive SPI LCD transfer happens later
+ * from a separate preview buffer in display_task().
+ */
+static esp_err_t scale_preview_frame(const uint8_t *frame, uint32_t width,
+                                     uint32_t height, size_t len, uint16_t *out)
+{
+    if (!frame || !out || len < (size_t)width * height * sizeof(uint16_t)) {
         return ESP_ERR_INVALID_SIZE;
     }
     if (width < PREVIEW_CROP_WIDTH || height < PREVIEW_CROP_HEIGHT) {
@@ -124,7 +211,7 @@ static esp_err_t preview_frame(const uint8_t *frame, uint32_t width, uint32_t he
             .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
         },
         .out = {
-            .buffer = s_preview,
+            .buffer = out,
             .buffer_size = PREVIEW_BUFFER_SIZE,
             .pic_w = ICG_LCD_WIDTH,
             .pic_h = ICG_PREVIEW_HEIGHT,
@@ -140,10 +227,7 @@ static esp_err_t preview_frame(const uint8_t *frame, uint32_t width, uint32_t he
         .mode = PPA_TRANS_MODE_BLOCKING,
     };
 
-    esp_err_t ret = ppa_do_scale_rotate_mirror(s_ppa, &op);
-    if (ret != ESP_OK) return ret;
-
-    return display_draw_preview(s_preview);
+    return ppa_do_scale_rotate_mirror(s_ppa, &op);
 }
 
 static esp_err_t run_preview(int fd)
@@ -205,7 +289,7 @@ static esp_err_t run_preview(int fd)
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "live preview started: crop=%dx%d scale=5/16 rotation=180 mirror_x=1",
+    ESP_LOGI(TAG, "live preview started: capture/3A decoupled from LCD; crop=%dx%d scale=5/16 rotation=180 mirror_x=1",
              PREVIEW_CROP_WIDTH, PREVIEW_CROP_HEIGHT);
     uint32_t frames = 0;
 
@@ -224,21 +308,34 @@ static esp_err_t run_preview(int fd)
             break;
         }
 
-        esp_err_t ret = preview_frame(buffers[b.index], fmt.fmt.pix.width,
-                                      fmt.fmt.pix.height, b.bytesused);
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "preview failed: %s", esp_err_to_name(ret));
+        int preview_index = preview_acquire_write_buffer();
+        if (preview_index < 0) {
+            ESP_LOGE(TAG, "no free preview buffer");
             break;
         }
 
-        ++frames;
-        if ((frames % 100) == 0) {
-            ESP_LOGI(TAG, "preview frames=%" PRIu32 " bytes=%" PRIu32, frames, b.bytesused);
-        }
+        esp_err_t ret = scale_preview_frame(buffers[b.index], fmt.fmt.pix.width,
+                                            fmt.fmt.pix.height, b.bytesused,
+                                            s_preview[preview_index]);
 
+        /* Camera buffer is no longer needed after PPA finishes reading it. */
         if (ioctl(fd, VIDIOC_QBUF, &b) != 0) {
             ESP_LOGE(TAG, "VIDIOC_QBUF failed: errno=%d", errno);
             break;
+        }
+
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "PPA preview failed: %s", esp_err_to_name(ret));
+            break;
+        }
+
+        preview_publish(preview_index);
+
+        ++frames;
+        if ((frames % 100) == 0) {
+            ESP_LOGI(TAG, "capture frames=%" PRIu32 " display=%" PRIu32
+                     " dropped_preview=%" PRIu32 " bytes=%" PRIu32,
+                     frames, s_display_frames, s_dropped_previews, b.bytesused);
         }
     }
 
@@ -251,7 +348,7 @@ static esp_err_t run_preview(int fd)
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "IMX708 -> ISP RGB565 -> PPA -> ILI9488 preview");
+    ESP_LOGI(TAG, "IMX708 -> ISP/IPA/AF -> PPA -> decoupled ILI9488 preview");
 
     ESP_ERROR_CHECK(display_init());
     ESP_ERROR_CHECK(camera_power_on());
@@ -267,10 +364,18 @@ void app_main(void)
     };
     ESP_ERROR_CHECK(ppa_register_client(&ppa_cfg, &s_ppa));
 
-    s_preview = heap_caps_aligned_alloc(PPA_CACHE_LINE_SIZE, PREVIEW_BUFFER_SIZE,
-                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!s_preview) {
-        ESP_LOGE(TAG, "preview buffer allocation failed");
+    for (int i = 0; i < PREVIEW_BUFFER_COUNT; ++i) {
+        s_preview[i] = heap_caps_aligned_alloc(PPA_CACHE_LINE_SIZE, PREVIEW_BUFFER_SIZE,
+                                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_preview[i]) {
+            ESP_LOGE(TAG, "preview buffer %d allocation failed", i);
+            return;
+        }
+    }
+
+    if (xTaskCreate(display_task, "lcd_preview", DISPLAY_TASK_STACK, NULL,
+                    DISPLAY_TASK_PRIORITY, &s_display_task) != pdPASS) {
+        ESP_LOGE(TAG, "display task creation failed");
         return;
     }
 
