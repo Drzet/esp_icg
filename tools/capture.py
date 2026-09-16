@@ -4,12 +4,15 @@
 The port can only have one owner. `idf.py monitor` holds it, so a monitor left
 running in another terminal makes `idf.py flash` fail with "Access is denied" -
 and a monitor cannot extract a binary payload anyway, since it mangles the bytes
-it prints. This script is the single owner: it flashes (optionally), resets the
-board, captures the stream, and pulls the images out of it.
+it prints. Without --flash this script attaches to the already-running board and
+does not toggle DTR/RTS or reset it.
 
 Run it from anywhere; it works out which project to flash:
 
-    # from the repo root - defaults to the imx708_snapshot example
+    # attach to an already-running MODE_CONSOLE build
+    python tools/capture.py --port /dev/ttyACM0 --interactive
+
+    # flash first, then capture
     python tools/capture.py --flash
 
     # from inside any example directory
@@ -255,8 +258,8 @@ def main():
                          'than AE and a returns it to auto (they alias - and +, which '
                          'argparse would read as an option here).')
     ap.add_argument('--interactive', action='store_true',
-                    help='forward your keystrokes to a MODE_CONSOLE build and echo the '
-                         'board back, so modes can be picked by hand while it runs.')
+                    help='forward raw single keystrokes to a running MODE_CONSOLE build '
+                         'without resetting the board, and echo the board back.')
     args = ap.parse_args()
     project = resolve_project(args.project)
     if args.flash:
@@ -283,10 +286,6 @@ def main():
         s.set_buffer_size(rx_size=1 << 20)
     except Exception:
         pass
-    s.dtr = False
-    s.rts = True
-    time.sleep(0.15)
-    s.rts = False
     keys = [k.strip() for k in args.keys.split(',')] if args.keys else []
     if args.interactive:
         print('--- interactive: press 0-4 for a mode, q to finish ---')
@@ -295,29 +294,45 @@ def main():
     echo_pos, echo_skip = 0, 0
     prompts_answered = 0
     t0 = time.time()
-    while time.time() - t0 < args.seconds:
-        d = s.read(65536)
-        if d:
-            buf += d
+
+    stdin_state = None
+    stdin_fd = None
+    if args.interactive and os.name != 'nt' and sys.stdin.isatty():
+        import termios
+        import tty
+        stdin_fd = sys.stdin.fileno()
+        stdin_state = termios.tcgetattr(stdin_fd)
+        tty.setcbreak(stdin_fd)
+
+    try:
+        while time.time() - t0 < args.seconds:
+            d = s.read(65536)
+            if d:
+                buf += d
+                if args.interactive:
+                    if echo_skip:
+                        have = min(echo_skip, len(buf) - echo_pos)
+                        echo_pos, echo_skip = echo_pos + have, echo_skip - have
+                    if not echo_skip:
+                        echo_pos, echo_skip = echo_console(buf, echo_pos)
+                if DONE_MARK in d or DONE_MARK in buf[-len(d) - 32:]:
+                    print(f'--- board reported done after {time.time() - t0:.1f}s ---')
+                    break
+                if keys and buf.count(MODE_PROMPT) > prompts_answered:
+                    k = keys.pop(0)
+                    prompts_answered += 1
+                    print(f'--- sending {k!r} ---')
+                    s.write(k.encode())
             if args.interactive:
-                if echo_skip:
-                    have = min(echo_skip, len(buf) - echo_pos)
-                    echo_pos, echo_skip = echo_pos + have, echo_skip - have
-                if not echo_skip:
-                    echo_pos, echo_skip = echo_console(buf, echo_pos)
-            if DONE_MARK in d or DONE_MARK in buf[-len(d) - 32:]:
-                print(f'--- board reported done after {time.time() - t0:.1f}s ---')
-                break
-            if keys and buf.count(MODE_PROMPT) > prompts_answered:
-                k = keys.pop(0)
-                prompts_answered += 1
-                print(f'--- sending {k!r} ---')
-                s.write(k.encode())
-        if args.interactive:
-            k = read_keypress()
-            if k:
-                s.write(k)
-    s.close()
+                k = read_keypress()
+                if k:
+                    s.write(k)
+    finally:
+        if stdin_state is not None:
+            import termios
+            termios.tcsetattr(stdin_fd, termios.TCSADRAIN, stdin_state)
+        s.close()
+
     images, notes, pos = [], [], 0
     while True:
         m = HDR.search(buf, pos)
