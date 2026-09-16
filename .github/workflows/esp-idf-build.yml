@@ -11,17 +11,27 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    container:
-      image: espressif/idf:v5.4.0
 
     steps:
-      - name: Checkout
+      - name: Checkout project
         uses: actions/checkout@v4
+
+      - name: Checkout ESP-IDF 5.4.0
+        uses: actions/checkout@v4
+        with:
+          repository: espressif/esp-idf
+          ref: v5.4
+          path: esp-idf-5.4.0
+          submodules: recursive
+
+      - name: Install ESP-IDF tools
+        shell: bash
+        run: ./esp-idf-5.4.0/install.sh esp32p4
 
       - name: Build ESP32-P4 firmware
         shell: bash
         run: |
-          source /opt/esp/idf/export.sh
+          source ./esp-idf-5.4.0/export.sh
           idf.py --version
           python --version
           idf.py set-target esp32p4
