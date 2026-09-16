@@ -13,6 +13,7 @@
 #include "esp_log.h"
 #include "esp_video_device.h"
 #include "esp_video_init.h"
+#include "esp_video_isp_pipeline.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "linux/videodev2.h"
@@ -245,9 +246,29 @@ void app_main(void)
     ESP_ERROR_CHECK(display_init());
     ESP_ERROR_CHECK(camera_power_on());
 
-    ESP_ERROR_CHECK(esp_video_init_with_flags(&s_video_config,
-                                              ESP_VIDEO_INIT_FLAGS_MIPI_CSI |
-                                              ESP_VIDEO_INIT_FLAGS_ISP));
+    esp_log_level_set("isp_video", ESP_LOG_DEBUG);
+    esp_log_level_set("esp_video", ESP_LOG_DEBUG);
+    esp_log_level_set("esp_video_isp", ESP_LOG_DEBUG);
+    esp_log_level_set("esp_ipa", ESP_LOG_DEBUG);
+    esp_log_level_set("ipa", ESP_LOG_DEBUG);
+
+    ESP_LOGI(TAG, "esp_video init: requesting MIPI-CSI + ISP + IPA controller");
+    esp_err_t video_ret = esp_video_init_with_flags(&s_video_config,
+                                                    ESP_VIDEO_INIT_FLAGS_MIPI_CSI |
+                                                    ESP_VIDEO_INIT_FLAGS_ISP);
+    ESP_LOGI(TAG, "esp_video init returned: %s (0x%x)",
+             esp_err_to_name(video_ret), (unsigned)video_ret);
+    ESP_ERROR_CHECK(video_ret);
+
+    uint32_t min_exposure_us = 0;
+    esp_err_t ipa_probe = esp_video_isp_pipeline_get_agc_min_exposure(&min_exposure_us);
+    if (ipa_probe == ESP_OK) {
+        ESP_LOGI(TAG, "IPA controller probe: OK, AGC min exposure=%" PRIu32 " us",
+                 min_exposure_us);
+    } else {
+        ESP_LOGE(TAG, "IPA controller probe FAILED: %s (0x%x)",
+                 esp_err_to_name(ipa_probe), (unsigned)ipa_probe);
+    }
 
     ppa_client_config_t ppa_cfg = {
         .oper_type = PPA_OPERATION_SRM,
