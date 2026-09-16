@@ -22,6 +22,10 @@
 #include "display.h"
 #include "touch.h"
 
+#if CONFIG_ESP_VIDEO_ISP_PIPELINE_CONTROL_CAMERA_MOTOR
+#error "Manual focus requires CONFIG_ESP_VIDEO_ISP_PIPELINE_CONTROL_CAMERA_MOTOR=n; regenerate sdkconfig from sdkconfig.defaults (idf.py set-target esp32p4)."
+#endif
+
 #define CAMERA_POWER_GPIO      0
 #define CAMERA_SCCB_I2C_PORT   0
 #define CAMERA_SCCB_SCL        8
@@ -35,22 +39,19 @@
 #define DISPLAY_TASK_PRIORITY  (tskIDLE_PRIORITY + 1)
 #define TOUCH_TASK_STACK       3072
 #define TOUCH_TASK_PRIORITY    (tskIDLE_PRIORITY + 1)
-#define PREVIEW_BORDER_PIXELS  2
 
-/* Three 156-pixel touch strips with two 6-pixel dead gaps: 156*3 + 6*2 = 480. */
-#define TOUCH_ZONE_WIDTH       156
-#define TOUCH_ZONE_GAP         6
+/* Three horizontal 102-pixel bands with two 7-pixel dead gaps: 102*3 + 7*2 = 320. */
+#define TOUCH_ZONE_HEIGHT      102
+#define TOUCH_ZONE_GAP         7
 
 /* Manual focus guard range for the standard ~75-degree Camera Module 3 lens. */
 #define FOCUS_CODE_1M          477
 #define FOCUS_CODE_30CM        552
-#define FOCUS_STEPS            26
+#define FOCUS_STEPS            (FOCUS_CODE_30CM - FOCUS_CODE_1M + 1)
 
 /*
  * PPA scale factors are quantized to 1/16. A centered 1536x1024 crop scales
  * exactly by 5/16 to 480x320, filling the landscape LCD without distortion.
- * Compared with the old 1536x896 -> 480x280 preview this crops a little more of
- * the sensor horizontally but removes the unused bottom strip.
  */
 #define PREVIEW_CROP_WIDTH     1536
 #define PREVIEW_CROP_HEIGHT    1024
@@ -90,8 +91,6 @@ typedef struct {
 static portMUX_TYPE s_control_lock = portMUX_INITIALIZER_UNLOCKED;
 static control_requests_t s_control_requests;
 static bool s_manual_ae;
-static bool s_manual_focus;
-static int32_t s_manual_focus_code = FOCUS_CODE_1M;
 
 static const esp_video_init_csi_config_t s_csi_config[] = {
     {
@@ -184,28 +183,27 @@ static bool write_focus_ctrl(int fd, int32_t value)
     return ioctl(fd, VIDIOC_S_EXT_CTRLS, &ctrls) == 0;
 }
 
-static int touch_zone_from_x(int x)
+static int touch_zone_from_y(int y)
 {
-    if (x >= 0 && x < TOUCH_ZONE_WIDTH) return 0;
+    if (y >= 0 && y < TOUCH_ZONE_HEIGHT) return 0;
 
-    int z1 = TOUCH_ZONE_WIDTH + TOUCH_ZONE_GAP;
-    if (x >= z1 && x < z1 + TOUCH_ZONE_WIDTH) return 1;
+    int z1 = TOUCH_ZONE_HEIGHT + TOUCH_ZONE_GAP;
+    if (y >= z1 && y < z1 + TOUCH_ZONE_HEIGHT) return 1;
 
-    int z2 = z1 + TOUCH_ZONE_WIDTH + TOUCH_ZONE_GAP;
-    if (x >= z2 && x < z2 + TOUCH_ZONE_WIDTH) return 2;
+    int z2 = z1 + TOUCH_ZONE_HEIGHT + TOUCH_ZONE_GAP;
+    if (y >= z2 && y < z2 + TOUCH_ZONE_HEIGHT) return 2;
 
     return -1;
 }
 
-static int slider_step_from_y(int y, int count)
+static int slider_step_from_x(int x, int count)
 {
-    if (y < 0) y = 0;
-    if (y >= ICG_LCD_HEIGHT) y = ICG_LCD_HEIGHT - 1;
+    if (x < 0) x = 0;
+    if (x >= ICG_LCD_WIDTH) x = ICG_LCD_WIDTH - 1;
 
-    /* Bottom is step 0, top is the highest step. */
-    int travel = ICG_LCD_HEIGHT - 1 - y;
-    return (travel * (count - 1) + (ICG_LCD_HEIGHT - 1) / 2) /
-           (ICG_LCD_HEIGHT - 1);
+    /* Left is step 0, right is the highest step. */
+    return (x * (count - 1) + (ICG_LCD_WIDTH - 1) / 2) /
+           (ICG_LCD_WIDTH - 1);
 }
 
 static void queue_exposure(int32_t lines)
@@ -247,7 +245,7 @@ static void touch_task(void *arg)
             continue;
         }
 
-        int zone = touch_zone_from_x(p.x);
+        int zone = touch_zone_from_y(p.y);
         if (zone < 0) {
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
@@ -255,11 +253,11 @@ static void touch_task(void *arg)
 
         int step;
         if (zone == 0) {
-            step = slider_step_from_y(p.y, (int)(sizeof(s_exposure_steps) / sizeof(s_exposure_steps[0])));
+            step = slider_step_from_x(p.x, (int)(sizeof(s_exposure_steps) / sizeof(s_exposure_steps[0])));
         } else if (zone == 1) {
-            step = slider_step_from_y(p.y, 47);
+            step = slider_step_from_x(p.x, 47);
         } else {
-            step = slider_step_from_y(p.y, FOCUS_STEPS);
+            step = slider_step_from_x(p.x, FOCUS_STEPS);
         }
 
         if (zone == active_zone && step == active_step) {
@@ -279,9 +277,7 @@ static void touch_task(void *arg)
             ESP_LOGI(TAG, "touch GAIN idx=%d raw=%u,%u xy=%d,%d",
                      step, p.raw_x, p.raw_y, p.x, p.y);
         } else {
-            int32_t code = FOCUS_CODE_1M +
-                           (step * (FOCUS_CODE_30CM - FOCUS_CODE_1M) +
-                            (FOCUS_STEPS - 1) / 2) / (FOCUS_STEPS - 1);
+            int32_t code = FOCUS_CODE_1M + step;
             queue_focus(code);
             ESP_LOGI(TAG, "touch FOCUS step=%d code=%" PRId32 " raw=%u,%u xy=%d,%d",
                      step, code, p.raw_x, p.raw_y, p.x, p.y);
@@ -325,20 +321,12 @@ static void apply_control_requests(int fd)
     }
 
     if (req.focus_pending) {
-        s_manual_focus = true;
-        s_manual_focus_code = req.focus_code;
-        ESP_LOGI(TAG, "manual focus takeover: holding code=%" PRId32,
-                 s_manual_focus_code);
-    }
-
-    /*
-     * esp_video currently has a public runtime switch for AGC but not for AF.
-     * Once the focus slider is touched, reassert the chosen VCM position every
-     * capture cycle so any later IPA AF update cannot retain control of the lens.
-     */
-    if (s_manual_focus && !write_focus_ctrl(fd, s_manual_focus_code)) {
-        ESP_LOGE(TAG, "holding focus=%" PRId32 " failed errno=%d",
-                 s_manual_focus_code, errno);
+        if (!write_focus_ctrl(fd, req.focus_code)) {
+            ESP_LOGE(TAG, "setting focus=%" PRId32 " failed errno=%d",
+                     req.focus_code, errno);
+        } else {
+            ESP_LOGI(TAG, "manual focus code=%" PRId32, req.focus_code);
+        }
     }
 }
 
@@ -396,27 +384,6 @@ static void display_task(void *arg)
         portENTER_CRITICAL(&s_preview_lock);
         s_display_preview = -1;
         portEXIT_CRITICAL(&s_preview_lock);
-    }
-}
-
-static void add_preview_border(uint16_t *out)
-{
-    const uint16_t white = 0xffff;
-
-    for (int y = 0; y < ICG_PREVIEW_HEIGHT; ++y) {
-        for (int x = 0; x < PREVIEW_BORDER_PIXELS; ++x) {
-            out[(size_t)y * ICG_LCD_WIDTH + x] = white;
-            out[(size_t)y * ICG_LCD_WIDTH + (ICG_LCD_WIDTH - 1 - x)] = white;
-        }
-    }
-
-    for (int y = 0; y < PREVIEW_BORDER_PIXELS; ++y) {
-        uint16_t *top = out + (size_t)y * ICG_LCD_WIDTH;
-        uint16_t *bottom = out + (size_t)(ICG_PREVIEW_HEIGHT - 1 - y) * ICG_LCD_WIDTH;
-        for (int x = 0; x < ICG_LCD_WIDTH; ++x) {
-            top[x] = white;
-            bottom[x] = white;
-        }
     }
 }
 
@@ -523,9 +490,10 @@ static esp_err_t run_preview(int fd)
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "live preview started: full-screen crop=%dx%d -> 480x320; 2px edge border",
+    ESP_LOGI(TAG, "live preview started: full-screen crop=%dx%d -> 480x320",
              PREVIEW_CROP_WIDTH, PREVIEW_CROP_HEIGHT);
-    ESP_LOGI(TAG, "touch zones: left=exposure centre=gain right=focus; bottom=min top=max");
+    ESP_LOGI(TAG, "touch bands: top=exposure middle=gain bottom=focus; left=min right=max");
+    ESP_LOGI(TAG, "manual focus: IPA motor writes disabled; direct DW9807 control only");
     uint32_t frames = 0;
 
     while (true) {
@@ -564,7 +532,6 @@ static esp_err_t run_preview(int fd)
             break;
         }
 
-        add_preview_border(s_preview[preview_index]);
         apply_control_requests(fd);
         preview_publish(preview_index);
 
@@ -601,7 +568,7 @@ static esp_err_t run_preview(int fd)
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "IMX708 -> ISP/IPA/AF -> PPA -> full-screen ILI9488 preview");
+    ESP_LOGI(TAG, "IMX708 -> ISP/IPA -> PPA -> full-screen ILI9488 preview");
 
     ESP_ERROR_CHECK(display_init());
     ESP_ERROR_CHECK(camera_power_on());
