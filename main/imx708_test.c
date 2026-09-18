@@ -21,6 +21,8 @@
 #include "app_config.h"
 #include "display.h"
 #include "touch.h"
+#include "recorder.h"
+#include "shared_spi.h"
 
 #if CONFIG_ESP_VIDEO_ISP_PIPELINE_CONTROL_CAMERA_MOTOR
 #error "Manual focus requires CONFIG_ESP_VIDEO_ISP_PIPELINE_CONTROL_CAMERA_MOTOR=n; regenerate sdkconfig from sdkconfig.defaults (idf.py set-target esp32p4)."
@@ -47,10 +49,8 @@
 /* Last 10% of exposure/gain slider travel is a hard maximum plateau. */
 #define SENSITIVITY_MAX_PLATEAU_X  ((ICG_LCD_WIDTH * 90) / 100)
 
-/* Manual focus guard range for the standard ~75-degree Camera Module 3 lens. */
-#define FOCUS_CODE_1M          477
-#define FOCUS_CODE_30CM        552
-#define FOCUS_STEPS            (FOCUS_CODE_30CM - FOCUS_CODE_1M + 1)
+/* Nominal 50 cm setting from the previously adopted standard-lens map. */
+#define FOCUS_CODE_50CM        509
 
 /*
  * PPA scale factors are quantized to 1/16. A centered 1536x1024 crop scales
@@ -88,13 +88,12 @@ typedef struct {
     int32_t exposure_lines;
     bool gain_pending;
     int32_t gain_index;
-    bool focus_pending;
-    int32_t focus_code;
 } control_requests_t;
 
 static portMUX_TYPE s_control_lock = portMUX_INITIALIZER_UNLOCKED;
 static control_requests_t s_control_requests;
 static bool s_manual_ae;
+static bool s_touch_available;
 
 static const esp_video_init_csi_config_t s_csi_config[] = {
     {
@@ -200,16 +199,6 @@ static int touch_zone_from_y(int y)
     return -1;
 }
 
-static int slider_step_from_x(int x, int count)
-{
-    if (x < 0) x = 0;
-    if (x >= ICG_LCD_WIDTH) x = ICG_LCD_WIDTH - 1;
-
-    /* Left is step 0, right is the highest step. */
-    return (x * (count - 1) + (ICG_LCD_WIDTH - 1) / 2) /
-           (ICG_LCD_WIDTH - 1);
-}
-
 static int sensitivity_step_from_x(int x, int count)
 {
     if (x < 0) x = 0;
@@ -241,30 +230,36 @@ static void queue_gain(int32_t index)
     portEXIT_CRITICAL(&s_control_lock);
 }
 
-static void queue_focus(int32_t code)
-{
-    portENTER_CRITICAL(&s_control_lock);
-    s_control_requests.focus_code = code;
-    s_control_requests.focus_pending = true;
-    portEXIT_CRITICAL(&s_control_lock);
-}
-
 static void touch_task(void *arg)
 {
     (void)arg;
     int active_zone = -1;
     int active_step = -1;
+    bool contact = false;
+    unsigned release_samples = 0;
 
     while (true) {
         touch_point_t p;
         if (!touch_read(&p)) {
-            active_zone = -1;
-            active_step = -1;
+            if (!touch_is_pressed() && ++release_samples >= 3) {
+                contact = false;
+                active_zone = -1;
+                active_step = -1;
+            }
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
 
+        release_samples = 0;
+        bool new_contact = !contact;
+        contact = true;
         int zone = touch_zone_from_y(p.y);
+        if (zone == 2) {
+            /* One action per press; dragging in from another band does nothing. */
+            if (new_contact) recorder_request(p.x < ICG_LCD_WIDTH / 2);
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
         if (zone < 0) {
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
@@ -274,10 +269,8 @@ static void touch_task(void *arg)
         if (zone == 0) {
             step = sensitivity_step_from_x(
                 p.x, (int)(sizeof(s_exposure_steps) / sizeof(s_exposure_steps[0])));
-        } else if (zone == 1) {
-            step = sensitivity_step_from_x(p.x, 47);
         } else {
-            step = slider_step_from_x(p.x, FOCUS_STEPS);
+            step = sensitivity_step_from_x(p.x, 47);
         }
 
         if (zone == active_zone && step == active_step) {
@@ -296,11 +289,6 @@ static void touch_task(void *arg)
             queue_gain(step);
             ESP_LOGI(TAG, "touch GAIN idx=%d raw=%u,%u xy=%d,%d",
                      step, p.raw_x, p.raw_y, p.x, p.y);
-        } else {
-            int32_t code = FOCUS_CODE_1M + step;
-            queue_focus(code);
-            ESP_LOGI(TAG, "touch FOCUS step=%d code=%" PRId32 " raw=%u,%u xy=%d,%d",
-                     step, code, p.raw_x, p.raw_y, p.x, p.y);
         }
 
         vTaskDelay(pdMS_TO_TICKS(20));
@@ -340,14 +328,7 @@ static void apply_control_requests(int fd)
         }
     }
 
-    if (req.focus_pending) {
-        if (!write_focus_ctrl(fd, req.focus_code)) {
-            ESP_LOGE(TAG, "setting focus=%" PRId32 " failed errno=%d",
-                     req.focus_code, errno);
-        } else {
-            ESP_LOGI(TAG, "manual focus code=%" PRId32, req.focus_code);
-        }
-    }
+
 }
 
 static int preview_acquire_write_buffer(void)
@@ -512,8 +493,18 @@ static esp_err_t run_preview(int fd)
 
     ESP_LOGI(TAG, "live preview started: full-screen crop=%dx%d -> 480x320",
              PREVIEW_CROP_WIDTH, PREVIEW_CROP_HEIGHT);
-    ESP_LOGI(TAG, "touch bands: top=exposure middle=gain bottom=focus; left=min right=max");
-    ESP_LOGI(TAG, "manual focus: IPA motor writes disabled; direct DW9807 control only");
+    if (!write_focus_ctrl(fd, FOCUS_CODE_50CM)) {
+        ESP_LOGE(TAG, "fixed focus failed errno=%d; stopping camera", errno);
+        goto cleanup;
+    }
+    ESP_LOGI(TAG, "focus locked: nominal 50 cm, DW9807 code=%d", FOCUS_CODE_50CM);
+    ESP_LOGI(TAG, "touch: top=exposure middle=gain bottom-left=record bottom-right=stop");
+    esp_err_t rec_ret = recorder_init(fmt.fmt.pix.width, fmt.fmt.pix.height);
+    if (rec_ret != ESP_OK) ESP_LOGE(TAG, "recorder unavailable: %s", esp_err_to_name(rec_ret));
+    if (s_touch_available && xTaskCreate(touch_task, "touch", TOUCH_TASK_STACK, NULL,
+                                        TOUCH_TASK_PRIORITY, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "touch task creation failed");
+    }
     uint32_t frames = 0;
 
     while (true) {
@@ -541,7 +532,11 @@ static esp_err_t run_preview(int fd)
                                             fmt.fmt.pix.height, b.bytesused,
                                             s_preview[preview_index]);
 
-        /* Camera source buffer is free immediately after PPA has consumed it. */
+        if (ret == ESP_OK) {
+            recorder_submit(buffers[b.index], b.bytesused, fmt.fmt.pix.bytesperline);
+        }
+
+        /* Recorder copies only an accepted frame; DMA never sees a requeued source. */
         if (ioctl(fd, VIDIOC_QBUF, &b) != 0) {
             ESP_LOGE(TAG, "VIDIOC_QBUF failed: errno=%d", errno);
             break;
@@ -579,6 +574,8 @@ static esp_err_t run_preview(int fd)
         }
     }
 
+cleanup:
+    recorder_request(false);
     ioctl(fd, VIDIOC_STREAMOFF, &type);
     for (uint32_t i = 0; i < count; ++i) {
         if (buffers[i]) munmap(buffers[i], lengths[i]);
@@ -619,13 +616,10 @@ void app_main(void)
         return;
     }
 
+    ESP_ERROR_CHECK(shared_spi_init());
     esp_err_t touch_ret = touch_init();
-    if (touch_ret == ESP_OK) {
-        if (xTaskCreate(touch_task, "touch", TOUCH_TASK_STACK, NULL,
-                        TOUCH_TASK_PRIORITY, NULL) != pdPASS) {
-            ESP_LOGE(TAG, "touch task creation failed");
-        }
-    } else {
+    s_touch_available = touch_ret == ESP_OK;
+    if (!s_touch_available) {
         ESP_LOGE(TAG, "touch init failed: %s; preview will continue", esp_err_to_name(touch_ret));
     }
 
