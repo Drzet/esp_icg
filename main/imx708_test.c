@@ -327,8 +327,6 @@ static void apply_control_requests(int fd)
                      req.gain_index, errno);
         }
     }
-
-
 }
 
 static int preview_acquire_write_buffer(void)
