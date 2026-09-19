@@ -22,7 +22,7 @@ int main(int argc, char **argv)
     /* Irregular capture intervals must set average playback cadence, not 10fps. */
     for (int i = 0; i < 10; ++i) {
         assert(avi_frame(&avi, data, n + (i & 1), (int64_t)i * 200000));
-        assert(avi_checkpoint(&avi));
+        if (i == 3 || i == 7) assert(avi_checkpoint(&avi));
     }
     assert(!avi_frame(&avi, data, n, 2000000));
     assert(avi_finish(&avi));

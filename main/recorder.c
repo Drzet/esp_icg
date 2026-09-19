@@ -17,9 +17,12 @@
 #include "sdmmc_cmd.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 
 #define MOUNT_POINT "/sdcard"
 #define INDEX_CAPACITY 6000
+#define JPEG_QUEUE_DEPTH 4
+#define JPEG_QUEUE_BYTES (3u * 1024u * 1024u)
 #define PERIOD_US (1000000 / ICG_RECORD_FPS)
 
 static const char *TAG = "recorder";
@@ -29,13 +32,23 @@ static rec_state_t s_state;
 static bool s_cancel_start, s_busy, s_ready;
 static uint32_t s_dropped;
 static int64_t s_frame_us, s_next_us;
-static TaskHandle_t s_task;
+static TaskHandle_t s_task, s_writer_task;
+typedef struct {
+    uint8_t *data;
+    uint32_t size;
+    int64_t time_us, copy_us, encode_us;
+} jpeg_frame_t;
+static QueueHandle_t s_jpeg_queue;
+/* Includes the frame being written; protected by s_lock. */
+static size_t s_queued_bytes;
+static uint32_t s_queue_drops;
+static int64_t s_copy_us;
 static uint32_t s_width, s_height;
 static uint8_t *s_raw, *s_jpeg;
 static size_t s_raw_size, s_jpeg_size;
 static jpeg_encoder_handle_t s_encoder;
 static avi_index_t *s_index;
-/* Only recorder_task accesses card, AVI state and file handles. */
+/* After initialization, only writer_task accesses card, AVI and files. */
 static sdmmc_card_t *s_card;
 static avi_writer_t s_avi;
 static char s_path[48];
@@ -122,14 +135,108 @@ static void finish_file(void)
         s_avi.file = NULL;
         if (s_avi.frames == 0) unlink(s_path);
     }
-    uint32_t dropped;
+    uint32_t dropped, queue_drops;
     portENTER_CRITICAL(&s_lock);
     dropped = s_dropped;
+    queue_drops = s_queue_drops;
     portEXIT_CRITICAL(&s_lock);
     unmount_card();
-    if (ok) ESP_LOGI(TAG, "STOP finalized %s frames=%" PRIu32 " busy_drops=%" PRIu32,
-                    s_path, s_avi.frames, dropped);
+    if (ok) ESP_LOGI(TAG, "STOP finalized %s frames=%" PRIu32 " busy_drops=%" PRIu32 " queue_drops=%" PRIu32,
+                    s_path, s_avi.frames, dropped, queue_drops);
     else ESP_LOGE(TAG, "STOP file finalization failed: %s (card full/removed or I/O error)", s_path);
+}
+
+static void request_error_stop(void)
+{
+    portENTER_CRITICAL(&s_lock);
+    s_state = REC_STOPPING;
+    portEXIT_CRITICAL(&s_lock);
+    xTaskNotifyGive(s_writer_task);
+}
+
+static void release_frame(jpeg_frame_t *frame)
+{
+    free(frame->data);
+    portENTER_CRITICAL(&s_lock);
+    s_queued_bytes -= frame->size;
+    portEXIT_CRITICAL(&s_lock);
+}
+
+static void writer_task(void *arg)
+{
+    (void)arg;
+    bool failed = false;
+    int64_t copy_total = 0, encode_total = 0, write_total = 0, sync_total = 0;
+    uint64_t byte_total = 0;
+    uint32_t samples = 0;
+    while (true) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        portENTER_CRITICAL(&s_lock);
+        rec_state_t state = s_state;
+        portEXIT_CRITICAL(&s_lock);
+        if (state == REC_STARTING) {
+            bool ok = start_file();
+            failed = false;
+            copy_total = encode_total = write_total = sync_total = 0;
+            byte_total = 0;
+            samples = 0;
+            portENTER_CRITICAL(&s_lock);
+            s_next_us = 0;
+            s_dropped = s_queue_drops = 0;
+            s_state = ok ? (s_cancel_start ? REC_STOPPING : REC_ACTIVE) : REC_IDLE;
+            portEXIT_CRITICAL(&s_lock);
+        }
+        jpeg_frame_t frame;
+        while (xQueueReceive(s_jpeg_queue, &frame, 0) == pdTRUE) {
+            if (!failed) {
+                int64_t begin = esp_timer_get_time();
+                bool ok = avi_frame(&s_avi, frame.data, frame.size, frame.time_us);
+                write_total += esp_timer_get_time() - begin;
+                copy_total += frame.copy_us;
+                encode_total += frame.encode_us;
+                byte_total += frame.size;
+                ++samples;
+                if (ok && s_avi.frames % ICG_RECORD_FPS == 0) {
+                    begin = esp_timer_get_time();
+                    ok = avi_checkpoint(&s_avi) && fsync(fileno(s_avi.file)) == 0;
+                    sync_total += esp_timer_get_time() - begin;
+                }
+                if (!ok) {
+                    failed = true;
+                    ESP_LOGE(TAG, "SD write/sync or AVI limit: stopping and discarding unwritten queue");
+                    request_error_stop();
+                }
+                if (samples == ICG_RECORD_FPS) {
+                    uint32_t drops;
+                    portENTER_CRITICAL(&s_lock);
+                    drops = s_queue_drops;
+                    portEXIT_CRITICAL(&s_lock);
+                    ESP_LOGI(TAG, "record avg us: copy=%" PRId64 " jpeg=%" PRId64
+                             " write=%" PRId64 " sync=%" PRId64
+                             " bytes=%" PRIu64 " queue_drops=%" PRIu32,
+                             copy_total / samples, encode_total / samples,
+                             write_total / samples, sync_total / samples,
+                             byte_total / samples, drops);
+                    copy_total = encode_total = write_total = sync_total = 0;
+                    byte_total = 0;
+                    samples = 0;
+                }
+            }
+            release_frame(&frame);
+        }
+        /* Snapshot producer completion BEFORE checking the queue. During STOP,
+         * no new raw frame can enter. The producer enqueues before clearing busy,
+         * so this ordering prevents closing a file ahead of its final JPEG. */
+        portENTER_CRITICAL(&s_lock);
+        bool drained_producer = s_state == REC_STOPPING && !s_busy;
+        portEXIT_CRITICAL(&s_lock);
+        if (drained_producer && uxQueueMessagesWaiting(s_jpeg_queue) == 0) {
+            finish_file();
+            portENTER_CRITICAL(&s_lock);
+            s_state = REC_IDLE;
+            portEXIT_CRITICAL(&s_lock);
+        }
+    }
 }
 
 static void recorder_task(void *arg)
@@ -144,46 +251,45 @@ static void recorder_task(void *arg)
     while (true) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         portENTER_CRITICAL(&s_lock);
-        rec_state_t state = s_state;
-        portEXIT_CRITICAL(&s_lock);
-        if (state == REC_STARTING) {
-            bool ok = start_file();
-            portENTER_CRITICAL(&s_lock);
-            s_state = ok ? (s_cancel_start ? REC_STOPPING : REC_ACTIVE) : REC_IDLE;
-            s_next_us = 0;
-            s_dropped = 0;
-            portEXIT_CRITICAL(&s_lock);
-        }
-
-        portENTER_CRITICAL(&s_lock);
         bool ready = s_ready;
-        int64_t timestamp = s_frame_us;
+        jpeg_frame_t frame = { .time_us = s_frame_us, .copy_us = s_copy_us };
         s_ready = false;
         portEXIT_CRITICAL(&s_lock);
-        if (ready) {
-            uint32_t size = 0;
-            esp_err_t ret = jpeg_encoder_process(s_encoder, &cfg, s_raw, s_raw_size,
-                                                 s_jpeg, s_jpeg_size, &size);
-            bool ok = ret == ESP_OK && avi_frame(&s_avi, s_jpeg, size, timestamp);
-            if (ok && s_avi.frames % ICG_RECORD_FPS == 0) {
-                ok = avi_checkpoint(&s_avi) && fsync(fileno(s_avi.file)) == 0;
-            }
-            if (!ok) ESP_LOGE(TAG, "recording stopped: encoder=%s; write/size/frame limit or SD error",
-                              esp_err_to_name(ret));
+        if (!ready) continue;
+
+        int64_t begin = esp_timer_get_time();
+        esp_err_t ret = jpeg_encoder_process(s_encoder, &cfg, s_raw, s_raw_size,
+                                             s_jpeg, s_jpeg_size, &frame.size);
+        frame.encode_us = esp_timer_get_time() - begin;
+        if (ret == ESP_OK) {
             portENTER_CRITICAL(&s_lock);
-            s_busy = false;
-            if (!ok) s_state = REC_STOPPING;
+            bool room = frame.size > 0 && frame.size <= JPEG_QUEUE_BYTES - s_queued_bytes;
+            if (room) s_queued_bytes += frame.size;
             portEXIT_CRITICAL(&s_lock);
+            bool queued = false;
+            if (room) {
+                /* Queue owns a private JPEG copy; encoder scratch can immediately
+                 * be reused while the writer holds an earlier frame. */
+                frame.data = heap_caps_malloc(frame.size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                if (frame.data) {
+                    memcpy(frame.data, s_jpeg, frame.size);
+                    queued = xQueueSend(s_jpeg_queue, &frame, 0) == pdTRUE;
+                }
+                if (!queued) release_frame(&frame);
+            }
+            if (!queued) {
+                portENTER_CRITICAL(&s_lock);
+                ++s_queue_drops;
+                portEXIT_CRITICAL(&s_lock);
+            }
+        } else {
+            ESP_LOGE(TAG, "JPEG encode failed: %s", esp_err_to_name(ret));
+            request_error_stop();
         }
         portENTER_CRITICAL(&s_lock);
-        bool stop = s_state == REC_STOPPING && !s_busy;
+        s_busy = false;
         portEXIT_CRITICAL(&s_lock);
-        if (stop) {
-            finish_file();
-            portENTER_CRITICAL(&s_lock);
-            s_state = REC_IDLE;
-            portEXIT_CRITICAL(&s_lock);
-        }
+        xTaskNotifyGive(s_writer_task);
     }
 }
 
@@ -208,6 +314,13 @@ esp_err_t recorder_init(uint32_t width, uint32_t height)
     /* Put a present card into SPI mode before the first XPT2046 transfer.
      * A missing card is nonfatal; RECORD retries mounting it. */
     mount_card();
+    s_jpeg_queue = xQueueCreate(JPEG_QUEUE_DEPTH, sizeof(jpeg_frame_t));
+    if (!s_jpeg_queue) { ret = ESP_ERR_NO_MEM; goto fail; }
+    if (xTaskCreate(writer_task, "sd_write", 6144, NULL, tskIDLE_PRIORITY + 1,
+                    &s_writer_task) != pdPASS) {
+        ret = ESP_ERR_NO_MEM;
+        goto fail;
+    }
     TaskHandle_t task;
     if (xTaskCreate(recorder_task, "sd_record", 6144, NULL, tskIDLE_PRIORITY + 1, &task) != pdPASS) {
         ret = ESP_ERR_NO_MEM;
@@ -221,6 +334,8 @@ esp_err_t recorder_init(uint32_t width, uint32_t height)
              ICG_SD_PIN_CS, ICG_SD_CLOCK_KHZ);
     return ESP_OK;
 fail:
+    if (s_writer_task) { vTaskDelete(s_writer_task); s_writer_task = NULL; }
+    if (s_jpeg_queue) { vQueueDelete(s_jpeg_queue); s_jpeg_queue = NULL; }
     unmount_card();
     if (s_encoder) { jpeg_del_encoder_engine(s_encoder); s_encoder = NULL; }
     free(s_raw); free(s_jpeg); free(s_index);
@@ -247,7 +362,7 @@ void recorder_request(bool start)
         }
     }
     portEXIT_CRITICAL(&s_lock);
-    if (accepted) xTaskNotifyGive(task);
+    if (accepted) xTaskNotifyGive(s_writer_task);
     if (start && !task) ESP_LOGW(TAG, "recorder not ready");
 }
 
@@ -259,11 +374,11 @@ void recorder_submit(const uint8_t *rgb565, size_t len, size_t stride)
     int64_t now = esp_timer_get_time();
     portENTER_CRITICAL(&s_lock);
     bool accept = s_state == REC_ACTIVE && now >= s_next_us && !s_busy;
-    if (s_state == REC_ACTIVE && now >= s_next_us) {
+    if (s_state == REC_ACTIVE && now >= s_next_us && s_busy) ++s_dropped;
+    if (accept) {
         s_next_us = now + PERIOD_US;
-        if (s_busy) ++s_dropped;
+        s_busy = true;
     }
-    if (accept) s_busy = true;
     portEXIT_CRITICAL(&s_lock);
     if (!accept) return;
     /* Same vertical flip as the preview's 180-degree rotation + X mirror;
@@ -275,8 +390,17 @@ void recorder_submit(const uint8_t *rgb565, size_t len, size_t stride)
         memcpy(s_raw + y * row_bytes, s_raw + (s_height - 1) * row_bytes, row_bytes);
     }
     portENTER_CRITICAL(&s_lock);
+    s_copy_us = esp_timer_get_time() - now;
     s_frame_us = now;
     s_ready = true;
     portEXIT_CRITICAL(&s_lock);
     xTaskNotifyGive(s_task);
+}
+
+bool recorder_is_recording(void)
+{
+    portENTER_CRITICAL(&s_lock);
+    bool active = s_state == REC_ACTIVE || s_state == REC_STOPPING;
+    portEXIT_CRITICAL(&s_lock);
+    return active;
 }

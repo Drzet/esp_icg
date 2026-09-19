@@ -41,6 +41,6 @@
  * SD SCLK/MOSI/MISO connect to GPIO20/21/22 alongside the XPT2046.
  */
 #define ICG_SD_PIN_CS        23
-#define ICG_SD_CLOCK_KHZ     20000
+#define ICG_SD_CLOCK_KHZ     40000
 #define ICG_RECORD_FPS       10
 #define ICG_RECORD_QUALITY   90

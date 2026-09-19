@@ -57,8 +57,8 @@ bool avi_frame(avi_writer_t *a, const uint8_t *jpeg, uint32_t size, int64_t time
         return false;
     uint8_t chunk[8];
     memcpy(chunk, "00dc", 4); put32(chunk + 4, size);
-    if (fseek(a->file, a->end, SEEK_SET) != 0 ||
-        fwrite(chunk, 1, 8, a->file) != 8 || fwrite(jpeg, 1, size, a->file) != size ||
+    /* begin/previous frame/checkpoint already leaves the append position. */
+    if (fwrite(chunk, 1, 8, a->file) != 8 || fwrite(jpeg, 1, size, a->file) != size ||
         ((size & 1) && fputc(0, a->file) == EOF)) return false;
     a->index[a->frames] = (avi_index_t){a->end - 220, size};
     a->end += 8 + size + (size & 1);

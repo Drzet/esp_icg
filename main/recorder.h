@@ -9,3 +9,6 @@ esp_err_t recorder_init(uint32_t width, uint32_t height);
 void recorder_request(bool start);
 /* Called before requeueing a camera buffer; copies only if worker is ready. */
 void recorder_submit(const uint8_t *rgb565, size_t len, size_t stride);
+
+/* True while accepting frames or draining/finalizing a recording. */
+bool recorder_is_recording(void);

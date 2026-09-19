@@ -7,7 +7,9 @@ are retained.
 
 ## Controls
 
-There are no drawn buttons or overlays. Coordinates use the existing landscape
+Controls remain invisible. A small red dot in the top-right corner indicates
+recording and stays on while Stop drains queued frames and finalizes the file.
+The dot appears only on the LCD, not in the recording. Coordinates use the existing landscape
 XPT2046 calibration:
 
 | Region | Action |
@@ -59,7 +61,7 @@ Existing GPIO allocations audited from the working source:
 | New SD CS | 23 |
 
 Both general SPI controllers were already occupied. SD shares **SPI3 with touch**
-at up to 20 MHz; touch stays at 2 MHz. LCD remains alone on SPI2. The SPI driver
+at up to 40 MHz; touch stays at 2 MHz. LCD remains alone on SPI2. The SPI driver
 arbitrates transfers; a separate mutex excludes touch during SD mount/unmount.
 At boot a present card enters SPI mode before touch polling begins. Insert the
 card before power-on; stop and wait for the `STOP finalized` log before removal.
@@ -71,12 +73,22 @@ Hot removal while recording is unsupported.
 - Full **1920×1080 RGB565 camera output → hardware JPEG q90, YUV422 → MJPEG AVI**.
   No audio. Full sensor view is retained with the preview's vertical orientation;
   the LCD alone uses its existing 1536×1024 center crop.
-- Up to **10 fps** requested. One private PSRAM input buffer keeps encoder/SD work
-  off the capture path; busy frames are dropped instead of blocking preview on SD.
-  Actual throughput must be measured on the card and wiring. Frame copying still
-  consumes memory bandwidth. Additional PSRAM is approximately 8.5 MB.
+- Up to **10 fps** requested. Separate JPEG encoder and SD writer tasks overlap
+  encoding with file I/O. A FIFO holds up to four waiting JPEGs, with a 3 MiB
+  payload budget covering queued, in-write and producer-reserved JPEG copies.
+  A full queue/budget or failed allocation drops the newest recording frame;
+  capture never waits for storage. The raw frame is reusable once encoding and
+  the compressed copy finish, without waiting for SD.
+- Recorder buffers use approximately 8.5 MB PSRAM, plus up to 3 MiB of JPEG
+  payloads. Actual throughput and 40 MHz signal integrity need board testing.
+- AVI frame writes append sequentially without per-frame seeks. Header checkpoints
+  restore the append position. The admission deadline advances only on acceptance.
+- Every ten written frames, serial logs show average `copy`, `jpeg`, `write`,
+  and amortized `sync` times in microseconds, JPEG `bytes`, and `queue_drops`.
+  Copy timing covers the raw flip/copy; JPEG queue-copy overhead is not included.
+  Buffered write time can shift to a later write or checkpoint.
 - `ICG00001.AVI`, `ICG00002.AVI`, etc. Exclusive creation prevents overwrites.
-- STOP drains an accepted frame, writes the AVI index and timing, flushes, closes
+- STOP drains the accepted raw frame and all queued JPEGs, writes the AVI index and timing, flushes, closes
   and unmounts the card. Mount, encode and write errors are reported over serial.
 - AVI uses the measured average capture interval. Overall cadence is corrected
   when frames drop, but individual irregular gaps are not represented exactly.
