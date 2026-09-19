@@ -81,6 +81,7 @@ static bool mount_card(void)
         .max_files = 2,
         .allocation_unit_size = 32 * 1024,
     };
+    ESP_LOGI(TAG, "SD mount starting: requested maximum %d kHz", ICG_SD_CLOCK_KHZ);
     shared_spi_mount_lock();
     esp_err_t ret = esp_vfs_fat_sdspi_mount(MOUNT_POINT, &host, &slot, &mount, &s_card);
     shared_spi_unlock();
@@ -90,6 +91,7 @@ static bool mount_card(void)
                  esp_err_to_name(ret));
         return false;
     }
+    sdmmc_card_print_info(stdout, s_card);
     return true;
 }
 
@@ -108,24 +110,35 @@ static bool start_file(void)
         unmount_card();
         return false;
     }
-    FILE *file = fdopen(fd, "wb+");
+    /* Reserve the name exclusively, then close it before the FAT helper opens
+     * it. This writer is the only task that creates/deletes recording files.
+     * Growing with VFS ftruncate() zero-fills all 64 MiB on ESP-IDF, which can
+     * block recording start for minutes. f_expand() only allocates clusters. */
+    if (close(fd) != 0) {
+        ESP_LOGE(TAG, "cannot close new recording: errno=%d", errno);
+        unlink(s_path);
+        unmount_card();
+        return false;
+    }
+    ESP_LOGI(TAG, "preallocating %u MiB for %s", PREALLOC_BYTES / (1024u * 1024u), s_path);
+    int64_t alloc_begin = esp_timer_get_time();
+    if (esp_vfs_fat_create_contiguous_file(MOUNT_POINT, s_path, PREALLOC_BYTES, true) != ESP_OK) {
+        ESP_LOGE(TAG, "AVI allocation failed: errno=%d (requires 64 MiB contiguous free space)", errno);
+        unlink(s_path);
+        unmount_card();
+        return false;
+    }
+    ESP_LOGI(TAG, "preallocation complete in %" PRId64 " ms", (esp_timer_get_time() - alloc_begin) / 1000);
+    /* r+b preserves the allocated file; wb+ would truncate it again. */
+    FILE *file = fopen(s_path, "r+b");
     if (!file) {
-        close(fd);
+        ESP_LOGE(TAG, "cannot reopen allocated AVI: errno=%d", errno);
         unlink(s_path);
         unmount_card();
         return false;
     }
     if (setvbuf(file, (char *)s_file_buffer, _IOFBF, FILE_BUFFER_BYTES) != 0) {
         ESP_LOGE(TAG, "cannot install %u KiB AVI buffer", FILE_BUFFER_BYTES / 1024u);
-        fclose(file);
-        unlink(s_path);
-        unmount_card();
-        return false;
-    }
-    /* Reserve roughly 30 seconds up front so FAT cluster allocation does not
-     * interrupt frame writes. The file is shrunk to its true AVI size on STOP. */
-    if (ftruncate(fd, PREALLOC_BYTES) != 0 || fseek(file, 0, SEEK_SET) != 0) {
-        ESP_LOGE(TAG, "AVI preallocation failed: errno=%d", errno);
         fclose(file);
         unlink(s_path);
         unmount_card();
@@ -312,6 +325,7 @@ static void recorder_task(void *arg)
 
 esp_err_t recorder_init(uint32_t width, uint32_t height)
 {
+    ESP_LOGI(TAG, "recorder initialization starting");
     /* This firmware's tested capture mode. Reject unexpected geometry instead
      * of silently overflowing buffers or producing a malformed JPEG. */
     if (width != 1920 || height != 1080) return ESP_ERR_NOT_SUPPORTED;
@@ -352,6 +366,10 @@ esp_err_t recorder_init(uint32_t width, uint32_t height)
              ICG_SD_PIN_CS, ICG_SD_CLOCK_KHZ);
     return ESP_OK;
 fail:
+    ESP_LOGE(TAG, "recorder initialization failed: %s; free internal=%u PSRAM=%u",
+             esp_err_to_name(ret),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     if (s_writer_task) { vTaskDelete(s_writer_task); s_writer_task = NULL; }
     if (s_jpeg_queue) { vQueueDelete(s_jpeg_queue); s_jpeg_queue = NULL; }
     unmount_card();
@@ -380,7 +398,13 @@ void recorder_request(bool start)
         }
     }
     portEXIT_CRITICAL(&s_lock);
-    if (accepted) xTaskNotifyGive(s_writer_task);
+    if (accepted) {
+        ESP_LOGI(TAG, "%s request accepted", start ? "RECORD" : "STOP");
+        xTaskNotifyGive(s_writer_task);
+    } else if (task) {
+        ESP_LOGI(TAG, "%s request ignored: recorder already starting/recording/stopping or idle",
+                 start ? "RECORD" : "STOP");
+    }
     if (start && !task) ESP_LOGW(TAG, "recorder not ready");
 }
 
