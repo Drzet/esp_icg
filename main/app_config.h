@@ -13,7 +13,7 @@
 #define ICG_LCD_HEIGHT     320
 #define ICG_PREVIEW_HEIGHT ICG_LCD_HEIGHT
 
-/* XPT2046 on its own SPI bus. */
+/* XPT2046 and SD share SPI3; each device has its own CS and clock. */
 #define ICG_TOUCH_HOST       SPI3_HOST
 #define ICG_TOUCH_PIN_CS     18
 #define ICG_TOUCH_PIN_IRQ    19
@@ -36,3 +36,11 @@
 #define ICG_TOUCH_SWAP_XY    1
 #define ICG_TOUCH_INVERT_X   0
 #define ICG_TOUCH_INVERT_Y   1
+
+/* WT9932P4-TINY left header pin 8: free GPIO23 (3.3 V domain).
+ * SD SCLK/MOSI/MISO connect to GPIO20/21/22 alongside the XPT2046.
+ */
+#define ICG_SD_PIN_CS        23
+#define ICG_SD_CLOCK_KHZ     40000
+#define ICG_RECORD_FPS       10
+#define ICG_RECORD_QUALITY   90
