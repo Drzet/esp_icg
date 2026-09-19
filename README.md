@@ -61,7 +61,10 @@ Existing GPIO allocations audited from the working source:
 | New SD CS | 23 |
 
 Both general SPI controllers were already occupied. SD shares **SPI3 with touch**
-at up to 40 MHz; touch stays at 2 MHz. LCD remains alone on SPI2. The SPI driver
+at up to 40 MHz; touch stays at 2 MHz. An invalid response/CRC or unsupported
+initialization at that setting triggers one fresh 20 MHz attempt. Serial reports
+the actual configured SD clock separately from the requested maximum.
+LCD remains alone on SPI2. The SPI driver
 arbitrates transfers; a separate mutex excludes touch during SD mount/unmount.
 At boot a present card enters SPI mode before touch polling begins. Insert the
 card before power-on; stop and wait for the `STOP finalized` log before removal.
@@ -76,27 +79,44 @@ Hot removal while recording is unsupported.
 - Up to **10 fps** requested. Separate JPEG encoder and SD writer tasks overlap
   encoding with file I/O. A FIFO holds up to four waiting JPEGs, with a 3 MiB
   payload budget covering queued, in-write and producer-reserved JPEG copies.
-  A full queue/budget or failed allocation drops the newest recording frame;
+  A full queue is checked before the raw copy/JPEG encode to avoid preparing
+  frames that storage cannot accept. A full budget or failed allocation also
+  drops the newest recording frame;
   capture never waits for storage. The raw frame is reusable once encoding and
   the compressed copy finish, without waiting for SD.
-- Recorder buffers use approximately 8.5 MB PSRAM, plus up to 3 MiB of JPEG
+- Recorder buffers use approximately 8.9 MB PSRAM, plus up to 3 MiB of JPEG
   payloads. Actual throughput and 40 MHz signal integrity need board testing.
+- A 512 KiB application buffer batches the AVI stream. Its contents pass through
+  a 16 KiB aligned internal DMA buffer to POSIX `write()`, avoiding libc buffering
+  overhead and the SDSPI driver's per-sector PSRAM staging copy. FatFs metadata
+  buffers also use internal RAM. Writes remain ordinary filesystem writes.
+- Before recording, reserve 64 MiB with the FatFs contiguous-allocation helper;
+  no zero-filling. This is a rough 30-second reservation, not a recording limit.
+  Longer recordings can grow beyond it. Start fails if that contiguous space is
+  unavailable; existing recordings are never deleted or overwritten.
 - AVI frame writes append sequentially without per-frame seeks. Header checkpoints
   restore the append position. The admission deadline advances only on acceptance.
-- Every ten written frames, serial logs show average `copy`, `jpeg`, `write`,
-  and amortized `sync` times in microseconds, JPEG `bytes`, and `queue_drops`.
+- Every ten appended frames, serial logs show average `copy`, `jpeg`, `write`
+  times in microseconds, JPEG `bytes`, and `queue_drops`.
   Copy timing covers the raw flip/copy; JPEG queue-copy overhead is not included.
-  Buffered write time can shift to a later write or checkpoint.
+  Buffered write time can shift to a later frame or STOP. `SD I/O cumulative`
+  separately reports single-block (`CMD24`) and multi-block (`CMD25`) write
+  commands, successfully transferred KiB, total driver time, throughput during
+  those commands, longest command and errors. Driver time includes card waiting
+  and task scheduling; it is not a measured wire speed. Final totals include STOP.
 - `ICG00001.AVI`, `ICG00002.AVI`, etc. Exclusive creation prevents overwrites.
-- STOP drains the accepted raw frame and all queued JPEGs, writes the AVI index and timing, flushes, closes
+- STOP drains the accepted raw frame and all queued JPEGs, writes the AVI index
+  and timing, flushes, truncates unused preallocation, synchronizes, closes
   and unmounts the card. Mount, encode and write errors are reported over serial.
 - AVI uses the measured average capture interval. Overall cadence is corrected
   when frames drop, but individual irregular gaps are not represented exactly.
 - Recording stops at 6,000 frames or approximately 1 GiB, whichever comes first;
   press RECORD again for a new file. This bounds RAM index and FAT/RIFF sizes.
-- Headers are checkpointed and synchronized about every 10 written frames.
-  Always STOP before power-off; checkpoints do not guarantee recovery after power
-  loss or card removal.
+- There are no periodic header checkpoints or `fsync` calls during recording.
+  Always STOP before power-off; an interrupted recording may be incomplete.
+
+The source review and diagnostic interpretation are in
+[docs/sd_recording_performance.md](docs/sd_recording_performance.md).
 
 ## Build and validation
 
@@ -111,3 +131,12 @@ AVI padding, index capacity, checkpoint/finalization and timestamp-derived rate;
 its output can be decoded and seek-checked with FFmpeg. Hardware checks still
 required: nominal focus at 50 cm, recorded color/orientation, SD/touch electrical
 sharing and sustained recording with exposure/gain changes.
+
+`tests/avi_io_test.c` checks byte-exact buffering across sector and buffer
+boundaries, aligned staging writes, interrupted/short writes, and sticky I/O
+failure handling. Run it on a native Linux host:
+
+```sh
+cc -std=gnu11 -Wall -Wextra -Werror -O2 -Imain main/avi_writer.c tests/avi_io_test.c -Wl,--wrap=write -o /tmp/avi_io_test
+/tmp/avi_io_test
+```

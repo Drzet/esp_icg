@@ -1,8 +1,64 @@
 #include "avi_writer.h"
+#include <errno.h>
 #include <string.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 #define HEADER_SIZE 224u
 #define MAX_FILE_SIZE (1024u * 1024u * 1024u)
+#define SECTOR_SIZE 512u
+
+/* Explicit buffering avoids libc-dependent fwrite behavior. Only this writer
+ * owns the fd, and every VFS write starts at the same aligned DMA buffer.
+ * FatFs may split these writes at cluster boundaries; SDSPI still sends the
+ * protocol-required 512-byte data blocks within each multi-block command. */
+static bool flush_buffer(avi_writer_t *a)
+{
+    if (a->io_failed) return false;
+    size_t done = 0;
+    while (done < a->buffered) {
+        size_t bytes = a->buffered - done;
+        if (bytes > a->io_buffer_size) bytes = a->io_buffer_size;
+        memcpy(a->io_buffer, a->buffer + done, bytes);
+        ssize_t written = write(a->fd, a->io_buffer, bytes);
+        if (written < 0 && errno == EINTR) continue;
+        if (written <= 0) {
+            if (written == 0) errno = EIO;
+            /* A partial flush cannot safely be replayed from its beginning. */
+            a->io_failed = true;
+            return false;
+        }
+        done += (size_t)written;
+    }
+    a->buffered = 0;
+    return true;
+}
+
+static bool append(avi_writer_t *a, const void *data, size_t size)
+{
+    if (a->io_failed) return false;
+    const uint8_t *src = data;
+    while (size) {
+        size_t bytes = a->buffer_size - a->buffered;
+        if (bytes > size) bytes = size;
+        memcpy(a->buffer + a->buffered, src, bytes);
+        a->buffered += bytes;
+        src += bytes;
+        size -= bytes;
+        if (a->buffered == a->buffer_size && !flush_buffer(a)) return false;
+    }
+    return true;
+}
+
+static bool seek_to(avi_writer_t *a, off_t offset)
+{
+    if (!flush_buffer(a)) return false;
+    if (lseek(a->fd, offset, SEEK_SET) != offset) {
+        a->io_failed = true;
+        return false;
+    }
+    return true;
+}
 
 static void put32(uint8_t *p, uint32_t v)
 {
@@ -38,28 +94,35 @@ static bool header(avi_writer_t *a, bool indexed)
     put32(h + 192, a->width * a->height * 3);
     memcpy(h + 212, "LIST", 4); put32(h + 216, a->end - 220);
     memcpy(h + 220, "movi", 4);
-    return fseek(a->file, 0, SEEK_SET) == 0 && fwrite(h, 1, sizeof(h), a->file) == sizeof(h);
+    return seek_to(a, 0) && append(a, h, sizeof(h));
 }
 
-bool avi_begin(avi_writer_t *a, FILE *file, avi_index_t *index, uint32_t capacity,
-               uint32_t width, uint32_t height, uint32_t period_us)
+bool avi_begin(avi_writer_t *a, int fd, avi_index_t *index, uint32_t capacity,
+               uint32_t width, uint32_t height, uint32_t period_us,
+               uint8_t *buffer, size_t buffer_size,
+               uint8_t *io_buffer, size_t io_buffer_size)
 {
-    if (!a || !file || !index || !capacity || !width || !height || !period_us) return false;
-    *a = (avi_writer_t){ .file = file, .index = index, .capacity = capacity,
+    if (!a || fd < 0 || !index || !capacity || !width || !height || !period_us ||
+        !buffer || !io_buffer || !buffer_size || !io_buffer_size ||
+        buffer_size % SECTOR_SIZE || io_buffer_size % SECTOR_SIZE) return false;
+    *a = (avi_writer_t){ .fd = fd, .buffer = buffer, .buffer_size = buffer_size,
+        .io_buffer = io_buffer, .io_buffer_size = io_buffer_size,
+        .index = index, .capacity = capacity,
         .end = HEADER_SIZE, .width = width, .height = height, .period_us = period_us };
     return header(a, false);
 }
 
 bool avi_frame(avi_writer_t *a, const uint8_t *jpeg, uint32_t size, int64_t time_us)
 {
-    if (!jpeg || !size || a->frames >= a->capacity ||
+    if (a->io_failed || !jpeg || !size || a->frames >= a->capacity ||
         (uint64_t)a->end + 8 + size + (size & 1) + 8 + (a->frames + 1) * 16 > MAX_FILE_SIZE)
         return false;
     uint8_t chunk[8];
     memcpy(chunk, "00dc", 4); put32(chunk + 4, size);
     /* begin/previous frame/checkpoint already leaves the append position. */
-    if (fwrite(chunk, 1, 8, a->file) != 8 || fwrite(jpeg, 1, size, a->file) != size ||
-        ((size & 1) && fputc(0, a->file) == EOF)) return false;
+    const uint8_t pad = 0;
+    if (!append(a, chunk, sizeof(chunk)) || !append(a, jpeg, size) ||
+        ((size & 1) && !append(a, &pad, 1))) return false;
     a->index[a->frames] = (avi_index_t){a->end - 220, size};
     a->end += 8 + size + (size & 1);
     if (a->frames == 0) a->first_us = time_us;
@@ -71,19 +134,18 @@ bool avi_frame(avi_writer_t *a, const uint8_t *jpeg, uint32_t size, int64_t time
 
 bool avi_checkpoint(avi_writer_t *a)
 {
-    return header(a, false) && fflush(a->file) == 0 &&
-           fseek(a->file, a->end, SEEK_SET) == 0;
+    return header(a, false) && seek_to(a, a->end);
 }
 
 bool avi_finish(avi_writer_t *a)
 {
     uint8_t entry[16];
     memcpy(entry, "idx1", 4); put32(entry + 4, a->frames * 16);
-    if (fseek(a->file, a->end, SEEK_SET) != 0 || fwrite(entry, 1, 8, a->file) != 8) return false;
+    if (!seek_to(a, a->end) || !append(a, entry, 8)) return false;
     for (uint32_t i = 0; i < a->frames; ++i) {
         memcpy(entry, "00dc", 4); put32(entry + 4, 0x10);
         put32(entry + 8, a->index[i].offset); put32(entry + 12, a->index[i].size);
-        if (fwrite(entry, 1, sizeof(entry), a->file) != sizeof(entry)) return false;
+        if (!append(a, entry, sizeof(entry))) return false;
     }
-    return header(a, true) && fflush(a->file) == 0;
+    return header(a, true) && flush_buffer(a);
 }
