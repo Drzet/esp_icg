@@ -24,6 +24,9 @@
 #define JPEG_QUEUE_DEPTH 4
 #define JPEG_QUEUE_BYTES (3u * 1024u * 1024u)
 #define PERIOD_US (1000000 / ICG_RECORD_FPS)
+#define FILE_BUFFER_BYTES (512u * 1024u)
+#define PREALLOC_SECONDS 30u
+#define PREALLOC_BYTES (64u * 1024u * 1024u)
 
 static const char *TAG = "recorder";
 typedef enum { REC_IDLE, REC_STARTING, REC_ACTIVE, REC_STOPPING } rec_state_t;
@@ -44,7 +47,7 @@ static size_t s_queued_bytes;
 static uint32_t s_queue_drops;
 static int64_t s_copy_us;
 static uint32_t s_width, s_height;
-static uint8_t *s_raw, *s_jpeg;
+static uint8_t *s_raw, *s_jpeg, *s_file_buffer;
 static size_t s_raw_size, s_jpeg_size;
 static jpeg_encoder_handle_t s_encoder;
 static avi_index_t *s_index;
@@ -112,7 +115,22 @@ static bool start_file(void)
         unmount_card();
         return false;
     }
-    setvbuf(file, NULL, _IOFBF, 32 * 1024);
+    if (setvbuf(file, (char *)s_file_buffer, _IOFBF, FILE_BUFFER_BYTES) != 0) {
+        ESP_LOGE(TAG, "cannot install %u KiB AVI buffer", FILE_BUFFER_BYTES / 1024u);
+        fclose(file);
+        unlink(s_path);
+        unmount_card();
+        return false;
+    }
+    /* Reserve roughly 30 seconds up front so FAT cluster allocation does not
+     * interrupt frame writes. The file is shrunk to its true AVI size on STOP. */
+    if (ftruncate(fd, PREALLOC_BYTES) != 0 || fseek(file, 0, SEEK_SET) != 0) {
+        ESP_LOGE(TAG, "AVI preallocation failed: errno=%d", errno);
+        fclose(file);
+        unlink(s_path);
+        unmount_card();
+        return false;
+    }
     if (!avi_begin(&s_avi, file, s_index, INDEX_CAPACITY, s_width, s_height, PERIOD_US)) {
         fclose(file);
         s_avi.file = NULL;
@@ -120,8 +138,10 @@ static bool start_file(void)
         unmount_card();
         return false;
     }
-    ESP_LOGI(TAG, "RECORD %s: %" PRIu32 "x%" PRIu32 " MJPEG q%d, up to %d fps",
-             s_path, s_width, s_height, ICG_RECORD_QUALITY, ICG_RECORD_FPS);
+    ESP_LOGI(TAG, "RECORD %s: %" PRIu32 "x%" PRIu32
+             " MJPEG q%d, up to %d fps, buffer=%u KiB prealloc=%u MiB (~%u s)",
+             s_path, s_width, s_height, ICG_RECORD_QUALITY, ICG_RECORD_FPS,
+             FILE_BUFFER_BYTES / 1024u, PREALLOC_BYTES / (1024u * 1024u), PREALLOC_SECONDS);
     return true;
 }
 
@@ -130,6 +150,10 @@ static void finish_file(void)
     bool ok = true;
     if (s_avi.file) {
         ok = avi_finish(&s_avi);
+        /* avi_finish() flushes stdio and writes the final index/header. Remove
+         * unused preallocated space, then perform the only fsync of recording. */
+        off_t final_size = (off_t)s_avi.end + 8 + (off_t)s_avi.frames * 16;
+        if (ok && ftruncate(fileno(s_avi.file), final_size) != 0) ok = false;
         if (ok && fsync(fileno(s_avi.file)) != 0) ok = false;
         if (fclose(s_avi.file) != 0) ok = false;
         s_avi.file = NULL;
@@ -166,7 +190,7 @@ static void writer_task(void *arg)
 {
     (void)arg;
     bool failed = false;
-    int64_t copy_total = 0, encode_total = 0, write_total = 0, sync_total = 0;
+    int64_t copy_total = 0, encode_total = 0, write_total = 0;
     uint64_t byte_total = 0;
     uint32_t samples = 0;
     while (true) {
@@ -177,7 +201,7 @@ static void writer_task(void *arg)
         if (state == REC_STARTING) {
             bool ok = start_file();
             failed = false;
-            copy_total = encode_total = write_total = sync_total = 0;
+            copy_total = encode_total = write_total = 0;
             byte_total = 0;
             samples = 0;
             portENTER_CRITICAL(&s_lock);
@@ -196,11 +220,6 @@ static void writer_task(void *arg)
                 encode_total += frame.encode_us;
                 byte_total += frame.size;
                 ++samples;
-                if (ok && s_avi.frames % ICG_RECORD_FPS == 0) {
-                    begin = esp_timer_get_time();
-                    ok = avi_checkpoint(&s_avi) && fsync(fileno(s_avi.file)) == 0;
-                    sync_total += esp_timer_get_time() - begin;
-                }
                 if (!ok) {
                     failed = true;
                     ESP_LOGE(TAG, "SD write/sync or AVI limit: stopping and discarding unwritten queue");
@@ -212,12 +231,10 @@ static void writer_task(void *arg)
                     drops = s_queue_drops;
                     portEXIT_CRITICAL(&s_lock);
                     ESP_LOGI(TAG, "record avg us: copy=%" PRId64 " jpeg=%" PRId64
-                             " write=%" PRId64 " sync=%" PRId64
-                             " bytes=%" PRIu64 " queue_drops=%" PRIu32,
+                             " write=%" PRId64 " bytes=%" PRIu64 " queue_drops=%" PRIu32,
                              copy_total / samples, encode_total / samples,
-                             write_total / samples, sync_total / samples,
-                             byte_total / samples, drops);
-                    copy_total = encode_total = write_total = sync_total = 0;
+                             write_total / samples, byte_total / samples, drops);
+                    copy_total = encode_total = write_total = 0;
                     byte_total = 0;
                     samples = 0;
                 }
@@ -306,8 +323,9 @@ esp_err_t recorder_init(uint32_t width, uint32_t height)
     s_raw = jpeg_alloc_encoder_mem(bytes, &in, &s_raw_size);
     s_jpeg = jpeg_alloc_encoder_mem(bytes, &out, &s_jpeg_size);
     s_index = heap_caps_malloc(INDEX_CAPACITY * sizeof(*s_index), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    s_file_buffer = heap_caps_malloc(FILE_BUFFER_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     esp_err_t ret = ESP_ERR_NO_MEM;
-    if (!s_raw || !s_jpeg || !s_index) goto fail;
+    if (!s_raw || !s_jpeg || !s_index || !s_file_buffer) goto fail;
     jpeg_encode_engine_cfg_t engine = { .timeout_ms = 1000 };
     ret = jpeg_new_encoder_engine(&engine, &s_encoder);
     if (ret != ESP_OK) goto fail;
@@ -338,8 +356,8 @@ fail:
     if (s_jpeg_queue) { vQueueDelete(s_jpeg_queue); s_jpeg_queue = NULL; }
     unmount_card();
     if (s_encoder) { jpeg_del_encoder_engine(s_encoder); s_encoder = NULL; }
-    free(s_raw); free(s_jpeg); free(s_index);
-    s_raw = NULL; s_jpeg = NULL; s_index = NULL;
+    free(s_raw); free(s_jpeg); free(s_index); free(s_file_buffer);
+    s_raw = NULL; s_jpeg = NULL; s_index = NULL; s_file_buffer = NULL;
     return ret;
 }
 
