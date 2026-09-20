@@ -419,7 +419,9 @@ static esp_err_t scale_preview_frame(const uint8_t *frame, uint32_t width,
             .block_offset_y = 0,
             .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
         },
-        .rotation_angle = PPA_SRM_ROTATION_ANGLE_180,
+        /* Camera is mounted 180 degrees from the original prototype.
+         * Removing the old 180-degree rotation adds the required half-turn. */
+        .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
         .scale_x = PREVIEW_SCALE,
         .scale_y = PREVIEW_SCALE,
         .mirror_x = true,

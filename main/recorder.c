@@ -495,10 +495,17 @@ void recorder_submit(const uint8_t *rgb565, size_t len, size_t stride)
     }
     portEXIT_CRITICAL(&s_lock);
     if (!accept) return;
-    /* Same vertical flip as the preview's 180-degree rotation + X mirror;
+    /* Same horizontal mirror as the preview, correcting the new camera mount
+     * by 180 degrees relative to the original vertical flip;
      * retain the full sensor view rather than the LCD's 3:2 center crop. */
     for (uint32_t y = 0; y < s_height; ++y) {
-        memcpy(s_raw + y * row_bytes, rgb565 + (s_height - 1 - y) * stride, row_bytes);
+        const uint8_t *src = rgb565 + y * stride;
+        uint8_t *dst = s_raw + y * row_bytes;
+        for (uint32_t x = 0; x < s_width; ++x) {
+            size_t src_x = (size_t)(s_width - 1 - x) * 2;
+            dst[2 * x] = src[src_x];
+            dst[2 * x + 1] = src[src_x + 1];
+        }
     }
     for (uint32_t y = s_height; y < ((s_height + 15) & ~15u); ++y) {
         memcpy(s_raw + y * row_bytes, s_raw + (s_height - 1) * row_bytes, row_bytes);
