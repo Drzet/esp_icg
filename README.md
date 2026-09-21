@@ -74,7 +74,8 @@ Hot removal while recording is unsupported.
 
 - FAT32 card mounted at `/sdcard`; failed mounts never format the card.
 - Full **1920×1080 RGB565 camera output → hardware JPEG q80, YUV422 → MJPEG AVI**.
-  No audio. Full sensor view is retained with the preview's vertical orientation;
+  No audio. Preview and recording preserve camera orientation without rotation or mirroring;
+  recording retains the full sensor view;
   the LCD alone uses its existing 1536×1024 center crop.
 - Up to **10 fps** requested. Separate JPEG encoder and SD writer tasks overlap
   encoding with file I/O. A FIFO holds up to four waiting JPEGs, with a 3 MiB
@@ -98,7 +99,7 @@ Hot removal while recording is unsupported.
   restore the append position. The admission deadline advances only on acceptance.
 - Every ten appended frames, serial logs show average `copy`, `jpeg`, `write`
   times in microseconds, JPEG `bytes`, and `queue_drops`.
-  Copy timing covers the raw flip/copy; JPEG queue-copy overhead is not included.
+  Copy timing covers the raw frame copy; JPEG queue-copy overhead is not included.
   Buffered write time can shift to a later frame or STOP. `SD I/O cumulative`
   separately reports single-block (`CMD24`) and multi-block (`CMD25`) write
   commands, successfully transferred KiB, total driver time, throughput during
