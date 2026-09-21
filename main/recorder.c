@@ -20,6 +20,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 
 #define MOUNT_POINT "/sdcard"
 #define INDEX_CAPACITY 6000
@@ -50,8 +51,11 @@ static size_t s_queued_bytes;
 static uint32_t s_queue_drops;
 static int64_t s_copy_us;
 static uint32_t s_width, s_height;
-static uint8_t *s_raw, *s_jpeg, *s_file_buffer, *s_dma_buffer;
-static size_t s_raw_size, s_jpeg_size;
+static const uint8_t *s_source;
+static size_t s_source_size;
+static SemaphoreHandle_t s_encode_done;
+static uint8_t *s_jpeg, *s_file_buffer, *s_dma_buffer;
+static size_t s_jpeg_size;
 static jpeg_encoder_handle_t s_encoder;
 static avi_index_t *s_index;
 /* After initialization, only writer_task accesses card, AVI and files. */
@@ -347,7 +351,14 @@ static void recorder_task(void *arg)
         if (!ready) continue;
 
         int64_t begin = esp_timer_get_time();
-        esp_err_t ret = jpeg_encoder_process(s_encoder, &cfg, s_raw, s_raw_size,
+        const uint8_t *source;
+        size_t source_size;
+        portENTER_CRITICAL(&s_lock);
+        source = s_source;
+        source_size = s_source_size;
+        portEXIT_CRITICAL(&s_lock);
+
+        esp_err_t ret = jpeg_encoder_process(s_encoder, &cfg, source, source_size,
                                              s_jpeg, s_jpeg_size, &frame.size);
         frame.encode_us = esp_timer_get_time() - begin;
         if (ret == ESP_OK) {
@@ -376,8 +387,11 @@ static void recorder_task(void *arg)
             request_error_stop();
         }
         portENTER_CRITICAL(&s_lock);
+        s_source = NULL;
+        s_source_size = 0;
         s_busy = false;
         portEXIT_CRITICAL(&s_lock);
+        xSemaphoreGive(s_encode_done);
         xTaskNotifyGive(s_writer_task);
     }
 }
@@ -389,11 +403,8 @@ esp_err_t recorder_init(uint32_t width, uint32_t height)
      * of silently overflowing buffers or producing a malformed JPEG. */
     if (width != 1920 || height != 1080) return ESP_ERR_NOT_SUPPORTED;
     s_width = width; s_height = height;
-    jpeg_encode_memory_alloc_cfg_t in = { .buffer_direction = JPEG_ENC_ALLOC_INPUT_BUFFER };
     jpeg_encode_memory_alloc_cfg_t out = { .buffer_direction = JPEG_ENC_ALLOC_OUTPUT_BUFFER };
-    /* Reserve complete MCU rows, including padding beyond the last source row. */
-    size_t bytes = (size_t)width * ((height + 15) & ~15u) * 2;
-    s_raw = jpeg_alloc_encoder_mem(bytes, &in, &s_raw_size);
+    size_t bytes = (size_t)width * height * 2;
     s_jpeg = jpeg_alloc_encoder_mem(bytes, &out, &s_jpeg_size);
     s_index = heap_caps_malloc(INDEX_CAPACITY * sizeof(*s_index), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     s_file_buffer = heap_caps_malloc(FILE_BUFFER_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -401,8 +412,9 @@ esp_err_t recorder_init(uint32_t width, uint32_t height)
      * buffers. Keep only a small staging block in scarce internal RAM. */
     s_dma_buffer = heap_caps_malloc(DMA_BUFFER_BYTES,
         MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_CACHE_ALIGNED);
+    s_encode_done = xSemaphoreCreateBinary();
     esp_err_t ret = ESP_ERR_NO_MEM;
-    if (!s_raw || !s_jpeg || !s_index || !s_file_buffer || !s_dma_buffer) goto fail;
+    if (!s_jpeg || !s_index || !s_file_buffer || !s_dma_buffer || !s_encode_done) goto fail;
     jpeg_encode_engine_cfg_t engine = { .timeout_ms = 1000 };
     ret = jpeg_new_encoder_engine(&engine, &s_encoder);
     if (ret != ESP_OK) goto fail;
@@ -435,10 +447,11 @@ fail:
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     if (s_writer_task) { vTaskDelete(s_writer_task); s_writer_task = NULL; }
     if (s_jpeg_queue) { vQueueDelete(s_jpeg_queue); s_jpeg_queue = NULL; }
+    if (s_encode_done) { vSemaphoreDelete(s_encode_done); s_encode_done = NULL; }
     unmount_card();
     if (s_encoder) { jpeg_del_encoder_engine(s_encoder); s_encoder = NULL; }
-    free(s_raw); free(s_jpeg); free(s_index); free(s_file_buffer); free(s_dma_buffer);
-    s_raw = NULL; s_jpeg = NULL; s_index = NULL; s_file_buffer = NULL; s_dma_buffer = NULL;
+    free(s_jpeg); free(s_index); free(s_file_buffer); free(s_dma_buffer);
+    s_jpeg = NULL; s_index = NULL; s_file_buffer = NULL; s_dma_buffer = NULL;
     return ret;
 }
 
@@ -475,11 +488,9 @@ void recorder_submit(const uint8_t *rgb565, size_t len, size_t stride)
 {
     size_t row_bytes = (size_t)s_width * 2;
     if (!stride) stride = row_bytes;
-    if (!rgb565 || !row_bytes || stride < row_bytes || len < stride * (s_height - 1) + row_bytes) return;
+    if (!rgb565 || stride != row_bytes || len < row_bytes * s_height) return;
+
     int64_t now = esp_timer_get_time();
-    /* There is only one producer. A full-queue snapshot may conservatively
-     * skip a frame just as the writer frees a slot, but never waits for SD.
-     * Avoid spending ~70 ms copying and ~34 ms encoding a doomed frame. */
     bool queue_full = s_jpeg_queue && uxQueueSpacesAvailable(s_jpeg_queue) == 0;
     portENTER_CRITICAL(&s_lock);
     bool accept = s_state == REC_ACTIVE && now >= s_next_us && !s_busy;
@@ -491,28 +502,20 @@ void recorder_submit(const uint8_t *rgb565, size_t len, size_t stride)
             accept = false;
         } else {
             s_busy = true;
+            s_source = rgb565;
+            s_source_size = len;
+            s_copy_us = 0;
+            s_frame_us = now;
+            s_ready = true;
         }
     }
     portEXIT_CRITICAL(&s_lock);
     if (!accept) return;
-    /* Preserve camera orientation and full sensor view. Skip source row
-     * padding when present; tightly packed frames need only one copy. */
-    if (stride == row_bytes) {
-        memcpy(s_raw, rgb565, row_bytes * s_height);
-    } else {
-        for (uint32_t y = 0; y < s_height; ++y) {
-            memcpy(s_raw + y * row_bytes, rgb565 + y * stride, row_bytes);
-        }
-    }
-    for (uint32_t y = s_height; y < ((s_height + 15) & ~15u); ++y) {
-        memcpy(s_raw + y * row_bytes, s_raw + (s_height - 1) * row_bytes, row_bytes);
-    }
-    portENTER_CRITICAL(&s_lock);
-    s_copy_us = esp_timer_get_time() - now;
-    s_frame_us = now;
-    s_ready = true;
-    portEXIT_CRITICAL(&s_lock);
+
+    /* JPEG reads directly from the dequeued V4L2 camera buffer. Keep ownership
+     * here until the encoder task finishes, then the caller may requeue it. */
     xTaskNotifyGive(s_task);
+    xSemaphoreTake(s_encode_done, portMAX_DELAY);
 }
 
 bool recorder_is_recording(void)
