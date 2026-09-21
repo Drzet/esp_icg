@@ -26,7 +26,9 @@
 #define INDEX_CAPACITY 6000
 #define JPEG_QUEUE_DEPTH 4
 #define JPEG_QUEUE_BYTES (3u * 1024u * 1024u)
-#define PERIOD_US (1000000 / ICG_RECORD_FPS)
+// Header fallback for fewer than two frames; never controls frame admission.
+#define AVI_DEFAULT_PERIOD_US 100000
+#define STATS_FRAMES 10
 #define FILE_BUFFER_BYTES (512u * 1024u)
 #define DMA_BUFFER_BYTES (16u * 1024u)
 #define PREALLOC_SECONDS 30u
@@ -38,7 +40,7 @@ static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
 static rec_state_t s_state;
 static bool s_cancel_start, s_busy, s_ready;
 static uint32_t s_dropped;
-static int64_t s_frame_us, s_next_us;
+static int64_t s_frame_us;
 static TaskHandle_t s_task, s_writer_task;
 typedef struct {
     uint8_t *data;
@@ -200,7 +202,7 @@ static bool start_file(void)
         unmount_card();
         return false;
     }
-    if (!avi_begin(&s_avi, fd, s_index, INDEX_CAPACITY, s_width, s_height, PERIOD_US,
+    if (!avi_begin(&s_avi, fd, s_index, INDEX_CAPACITY, s_width, s_height, AVI_DEFAULT_PERIOD_US,
                    s_file_buffer, FILE_BUFFER_BYTES, s_dma_buffer, DMA_BUFFER_BYTES)) {
         close(fd);
         s_avi.fd = -1;
@@ -209,8 +211,8 @@ static bool start_file(void)
         return false;
     }
     ESP_LOGI(TAG, "RECORD %s: %" PRIu32 "x%" PRIu32
-             " MJPEG q%d, up to %d fps, buffer=%u KiB DMA=%u KiB prealloc=%u MiB (~%u s)",
-             s_path, s_width, s_height, ICG_RECORD_QUALITY, ICG_RECORD_FPS,
+             " MJPEG q%d, queue-limited, buffer=%u KiB DMA=%u KiB prealloc=%u MiB (~%u s)",
+             s_path, s_width, s_height, ICG_RECORD_QUALITY,
              FILE_BUFFER_BYTES / 1024u, DMA_BUFFER_BYTES / 1024u,
              PREALLOC_BYTES / (1024u * 1024u), PREALLOC_SECONDS);
     memset(&s_sd_stats, 0, sizeof(s_sd_stats));
@@ -280,7 +282,6 @@ static void writer_task(void *arg)
             byte_total = 0;
             samples = 0;
             portENTER_CRITICAL(&s_lock);
-            s_next_us = 0;
             s_dropped = s_queue_drops = 0;
             s_state = ok ? (s_cancel_start ? REC_STOPPING : REC_ACTIVE) : REC_IDLE;
             portEXIT_CRITICAL(&s_lock);
@@ -300,7 +301,7 @@ static void writer_task(void *arg)
                     ESP_LOGE(TAG, "SD write or AVI limit: stopping and discarding unwritten queue (errno=%d)", errno);
                     request_error_stop();
                 }
-                if (samples == ICG_RECORD_FPS) {
+                if (samples == STATS_FRAMES) {
                     uint32_t drops;
                     portENTER_CRITICAL(&s_lock);
                     drops = s_queue_drops;
@@ -493,10 +494,9 @@ void recorder_submit(const uint8_t *rgb565, size_t len, size_t stride)
     int64_t now = esp_timer_get_time();
     bool queue_full = s_jpeg_queue && uxQueueSpacesAvailable(s_jpeg_queue) == 0;
     portENTER_CRITICAL(&s_lock);
-    bool accept = s_state == REC_ACTIVE && now >= s_next_us && !s_busy;
-    if (s_state == REC_ACTIVE && now >= s_next_us && s_busy) ++s_dropped;
+    bool accept = s_state == REC_ACTIVE && !s_busy;
+    if (s_state == REC_ACTIVE && s_busy) ++s_dropped;
     if (accept) {
-        s_next_us = now + PERIOD_US;
         if (queue_full) {
             ++s_queue_drops;
             accept = false;

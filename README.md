@@ -77,10 +77,11 @@ Hot removal while recording is unsupported.
   No audio. Preview and recording preserve camera orientation without rotation or mirroring;
   recording retains the full sensor view;
   the LCD alone uses its existing 1536×1024 center crop.
-- Up to **10 fps** requested. Separate JPEG encoder and SD writer tasks overlap
+- No recording time gate: every delivered camera frame is eligible when the
+  encoder and JPEG queue have capacity. Separate JPEG encoder and SD writer tasks overlap
   encoding with file I/O. A FIFO holds up to four waiting JPEGs, with a 3 MiB
   payload budget covering queued, in-write and producer-reserved JPEG copies.
-  A full queue is checked before the raw copy/JPEG encode to avoid preparing
+  A full queue is checked before JPEG encoding to avoid preparing
   frames that storage cannot accept. A full budget or failed allocation also
   drops the newest recording frame;
   capture never waits for storage. The raw frame is reusable once encoding and

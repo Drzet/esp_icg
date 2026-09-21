@@ -42,5 +42,4 @@
  */
 #define ICG_SD_PIN_CS        23
 #define ICG_SD_CLOCK_KHZ     40000
-#define ICG_RECORD_FPS       10
 #define ICG_RECORD_QUALITY   80
