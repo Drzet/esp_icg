@@ -459,6 +459,7 @@ static esp_err_t run_preview(int fd)
     struct v4l2_streamparm parm = {
         .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
     };
+    parm.parm.capture.capability = V4L2_CAP_TIMEPERFRAME;
     parm.parm.capture.timeperframe.numerator = 1;
     parm.parm.capture.timeperframe.denominator = 14;
     if (ioctl(fd, VIDIOC_S_PARM, &parm) != 0) {
