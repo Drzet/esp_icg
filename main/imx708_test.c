@@ -456,6 +456,27 @@ static esp_err_t run_preview(int fd)
         return ESP_ERR_NOT_SUPPORTED;
     }
 
+    struct v4l2_streamparm parm = {
+        .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+    };
+    parm.parm.capture.timeperframe.numerator = 1;
+    parm.parm.capture.timeperframe.denominator = 14;
+    if (ioctl(fd, VIDIOC_S_PARM, &parm) != 0) {
+        ESP_LOGW(TAG, "VIDIOC_S_PARM 14 fps failed: errno=%d", errno);
+    } else {
+        struct v4l2_streamparm actual = {
+            .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+        };
+        if (ioctl(fd, VIDIOC_G_PARM, &actual) == 0 &&
+            actual.parm.capture.timeperframe.numerator != 0) {
+            ESP_LOGI(TAG, "capture interval: %u/%u s (%.2f fps)",
+                     actual.parm.capture.timeperframe.numerator,
+                     actual.parm.capture.timeperframe.denominator,
+                     (double)actual.parm.capture.timeperframe.denominator /
+                     actual.parm.capture.timeperframe.numerator);
+        }
+    }
+
     struct v4l2_requestbuffers req = {
         .count = CAMERA_BUFFER_COUNT,
         .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
@@ -535,7 +556,7 @@ static esp_err_t run_preview(int fd)
             recorder_submit(buffers[b.index], b.bytesused, fmt.fmt.pix.bytesperline);
         }
 
-        /* Recorder copies only an accepted frame; DMA never sees a requeued source. */
+        /* recorder_submit() retains accepted buffers until JPEG has finished reading them. */
         if (ioctl(fd, VIDIOC_QBUF, &b) != 0) {
             ESP_LOGE(TAG, "VIDIOC_QBUF failed: errno=%d", errno);
             break;
