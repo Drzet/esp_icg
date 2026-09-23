@@ -23,6 +23,7 @@
 #include "touch.h"
 #include "recorder.h"
 #include "shared_spi.h"
+#include "isp_diag.h"
 
 #if CONFIG_ESP_VIDEO_ISP_PIPELINE_CONTROL_CAMERA_MOTOR
 #error "Manual focus requires CONFIG_ESP_VIDEO_ISP_PIPELINE_CONTROL_CAMERA_MOTOR=n; regenerate sdkconfig from sdkconfig.defaults (idf.py set-target esp32p4)."
@@ -615,6 +616,11 @@ void app_main(void)
                                               ESP_VIDEO_INIT_FLAGS_MIPI_CSI |
                                               ESP_VIDEO_INIT_FLAGS_ISP |
                                               ESP_VIDEO_INIT_FLAGS_MOTOR));
+
+    esp_err_t diag_ret = isp_diag_start();
+    if (diag_ret != ESP_OK) {
+        ESP_LOGW(TAG, "ISP diagnostics unavailable: %s", esp_err_to_name(diag_ret));
+    }
 
     ppa_client_config_t ppa_cfg = {
         .oper_type = PPA_OPERATION_SRM,
