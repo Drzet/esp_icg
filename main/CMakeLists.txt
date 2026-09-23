@@ -6,6 +6,7 @@ idf_component_register(
         "shared_spi.c"
         "recorder.c"
         "avi_writer.c"
+        "isp_diag.c"
     INCLUDE_DIRS "."
     REQUIRES
         esp_video
