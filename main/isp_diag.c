@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -179,7 +180,7 @@ static void isp_diag_task(void *arg)
      */
     vTaskDelay(pdMS_TO_TICKS(1000));
 
-    int fd = open(ESP_VIDEO_ISP1_DEVICE_NAME, O_RDONLY);
+    int fd = open(ESP_VIDEO_ISP1_DEVICE_NAME, O_RDWR);
     if (fd < 0) {
         ESP_LOGE(TAG, "open %s failed: errno=%d", ESP_VIDEO_ISP1_DEVICE_NAME, errno);
         s_started = false;
