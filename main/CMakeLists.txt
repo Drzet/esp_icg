@@ -3,6 +3,10 @@ idf_component_register(
         "imx708_test.c"
         "display.c"
         "touch.c"
+        "shared_spi.c"
+        "recorder.c"
+        "avi_writer.c"
+        "isp_diag.c"
     INCLUDE_DIRS "."
     REQUIRES
         esp_video
@@ -10,5 +14,9 @@ idf_component_register(
         esp_driver_gpio
         esp_driver_ppa
         esp_driver_spi
+        esp_driver_jpeg
+        fatfs
+        sdmmc
+        esp_timer
         esp_lcd
 )

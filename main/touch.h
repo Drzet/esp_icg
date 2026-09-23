@@ -13,3 +13,5 @@ typedef struct {
 
 esp_err_t touch_init(void);
 bool touch_read(touch_point_t *point);
+
+bool touch_is_pressed(void);
