@@ -7,6 +7,8 @@
 esp_err_t recorder_init(uint32_t width, uint32_t height);
 /* Thread-safe, nonblocking commands. Start while active is a no-op. */
 void recorder_request(bool start);
+/* Toggle atomically: idle starts; starting/active stops; stopping ignores. */
+void recorder_toggle(void);
 /* Called before requeueing a camera buffer; accepted frames remain owned until JPEG finishes. */
 void recorder_submit(const uint8_t *rgb565, size_t len, size_t stride);
 

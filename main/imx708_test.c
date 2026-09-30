@@ -50,8 +50,13 @@
 /* Last 10% of exposure/gain slider travel is a hard maximum plateau. */
 #define SENSITIVITY_MAX_PLATEAU_X  ((ICG_LCD_WIDTH * 90) / 100)
 
-/* Nominal 50 cm setting from the previously adopted standard-lens map. */
+/* Nominal distances from Raspberry Pi's standard IMX708 map:
+ * code = 445 + 32 * dioptres. [INFERRED] Distances need IR/filter calibration.
+ * https://github.com/raspberrypi/libcamera/blob/main/src/ipa/rpi/vc4/data/imx708.json
+ */
 #define FOCUS_CODE_50CM        509
+#define FOCUS_CODE_20CM        605
+#define FOCUS_CODE_30CM        552
 
 /*
  * PPA scale factors are quantized to 1/16. A centered 1536x1024 crop scales
@@ -87,6 +92,8 @@ static const uint16_t s_exposure_steps[] = {
 typedef struct {
     bool exposure_pending;
     int32_t exposure_lines;
+    bool focus_pending;
+    int32_t focus_code;
     bool gain_pending;
     int32_t gain_index;
 } control_requests_t;
@@ -231,19 +238,53 @@ static void queue_gain(int32_t index)
     portEXIT_CRITICAL(&s_control_lock);
 }
 
+static void queue_focus(int32_t code)
+{
+    portENTER_CRITICAL(&s_control_lock);
+    s_control_requests.focus_code = code;
+    s_control_requests.focus_pending = true;
+    portEXIT_CRITICAL(&s_control_lock);
+}
+
+static void record_button_task(void *arg)
+{
+    (void)arg;
+    int candidate = gpio_get_level(ICG_RECORD_BUTTON_GPIO);
+    int stable = candidate;
+    bool armed = false;
+    TickType_t changed = xTaskGetTickCount();
+    while (true) {
+        int level = gpio_get_level(ICG_RECORD_BUTTON_GPIO);
+        TickType_t now = xTaskGetTickCount();
+        if (level != candidate) {
+            candidate = level;
+            changed = now;
+        }
+        if ((TickType_t)(now - changed) >= pdMS_TO_TICKS(40)) {
+            if (candidate != stable) {
+                stable = candidate;
+                if (stable == 0 && armed) {
+                    armed = false;
+                    recorder_toggle();
+                }
+            }
+            if (stable == 1) armed = true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
 static void touch_task(void *arg)
 {
     (void)arg;
     int active_zone = -1;
     int active_step = -1;
-    bool contact = false;
     unsigned release_samples = 0;
 
     while (true) {
         touch_point_t p;
         if (!touch_read(&p)) {
             if (!touch_is_pressed() && ++release_samples >= 3) {
-                contact = false;
                 active_zone = -1;
                 active_step = -1;
             }
@@ -252,15 +293,7 @@ static void touch_task(void *arg)
         }
 
         release_samples = 0;
-        bool new_contact = !contact;
-        contact = true;
         int zone = touch_zone_from_y(p.y);
-        if (zone == 2) {
-            /* One action per press; dragging in from another band does nothing. */
-            if (new_contact) recorder_request(p.x < ICG_LCD_WIDTH / 2);
-            vTaskDelay(pdMS_TO_TICKS(20));
-            continue;
-        }
         if (zone < 0) {
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
@@ -270,8 +303,12 @@ static void touch_task(void *arg)
         if (zone == 0) {
             step = sensitivity_step_from_x(
                 p.x, (int)(sizeof(s_exposure_steps) / sizeof(s_exposure_steps[0])));
-        } else {
+        } else if (zone == 1) {
             step = sensitivity_step_from_x(p.x, 47);
+        } else {
+            int x = p.x < 0 ? 0 : p.x >= ICG_LCD_WIDTH ? ICG_LCD_WIDTH - 1 : p.x;
+            step = (x * (FOCUS_CODE_20CM - FOCUS_CODE_50CM) +
+                    (ICG_LCD_WIDTH - 1) / 2) / (ICG_LCD_WIDTH - 1);
         }
 
         if (zone == active_zone && step == active_step) {
@@ -290,6 +327,11 @@ static void touch_task(void *arg)
             queue_gain(step);
             ESP_LOGI(TAG, "touch GAIN idx=%d raw=%u,%u xy=%d,%d",
                      step, p.raw_x, p.raw_y, p.x, p.y);
+        } else {
+            int32_t code = FOCUS_CODE_50CM + step;
+            queue_focus(code);
+            ESP_LOGI(TAG, "touch FOCUS code=%" PRId32 " raw=%u,%u xy=%d,%d",
+                     code, p.raw_x, p.raw_y, p.x, p.y);
         }
 
         vTaskDelay(pdMS_TO_TICKS(20));
@@ -327,6 +369,9 @@ static void apply_control_requests(int fd)
             ESP_LOGE(TAG, "setting gain_idx=%" PRId32 " failed errno=%d",
                      req.gain_index, errno);
         }
+    }
+    if (req.focus_pending && !write_focus_ctrl(fd, req.focus_code)) {
+        ESP_LOGE(TAG, "setting focus=%" PRId32 " failed errno=%d", req.focus_code, errno);
     }
 }
 
@@ -515,17 +560,35 @@ static esp_err_t run_preview(int fd)
 
     ESP_LOGI(TAG, "live preview started: full-screen crop=%dx%d -> 480x320",
              PREVIEW_CROP_WIDTH, PREVIEW_CROP_HEIGHT);
-    if (!write_focus_ctrl(fd, FOCUS_CODE_50CM)) {
-        ESP_LOGE(TAG, "fixed focus failed errno=%d; stopping camera", errno);
+    if (!write_focus_ctrl(fd, FOCUS_CODE_30CM)) {
+        ESP_LOGE(TAG, "initial focus failed errno=%d; stopping camera", errno);
         goto cleanup;
     }
-    ESP_LOGI(TAG, "focus locked: nominal 50 cm, DW9807 code=%d", FOCUS_CODE_50CM);
-    ESP_LOGI(TAG, "touch: top=exposure middle=gain bottom-left=record bottom-right=stop");
+    ESP_LOGI(TAG, "manual focus: nominal 20-50 cm, default 30 cm, DW9807 code=%d", FOCUS_CODE_30CM);
+    ESP_LOGI(TAG, "touch: top=exposure middle=gain bottom=focus (left=50 cm right=20 cm)");
     esp_err_t rec_ret = recorder_init(fmt.fmt.pix.width, fmt.fmt.pix.height);
     if (rec_ret != ESP_OK) ESP_LOGE(TAG, "recorder unavailable: %s", esp_err_to_name(rec_ret));
     if (s_touch_available && xTaskCreate(touch_task, "touch", TOUCH_TASK_STACK, NULL,
                                         TOUCH_TASK_PRIORITY, NULL) != pdPASS) {
         ESP_LOGE(TAG, "touch task creation failed");
+    }
+    if (rec_ret == ESP_OK) {
+        gpio_config_t button_cfg = {
+            .pin_bit_mask = 1ULL << ICG_RECORD_BUTTON_GPIO,
+            .mode = GPIO_MODE_INPUT,
+            .pull_up_en = GPIO_PULLUP_ENABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+        esp_err_t button_ret = gpio_config(&button_cfg);
+        if (button_ret != ESP_OK) {
+            ESP_LOGE(TAG, "record button init failed: %s", esp_err_to_name(button_ret));
+        } else if (xTaskCreate(record_button_task, "rec_button", 2048, NULL,
+                               tskIDLE_PRIORITY + 1, NULL) != pdPASS) {
+            ESP_LOGE(TAG, "record button task creation failed");
+        } else {
+            ESP_LOGI(TAG, "record/stop button: GPIO%d to GND", ICG_RECORD_BUTTON_GPIO);
+        }
     }
     uint32_t frames = 0;
 

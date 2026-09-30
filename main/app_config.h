@@ -43,3 +43,6 @@
 #define ICG_SD_PIN_CS        23
 #define ICG_SD_CLOCK_KHZ     40000
 #define ICG_RECORD_QUALITY   80
+
+/* Momentary record/stop button: GPIO34 to GND, active low. */
+#define ICG_RECORD_BUTTON_GPIO 34

@@ -456,9 +456,10 @@ fail:
     return ret;
 }
 
-void recorder_request(bool start)
+static void recorder_command(int command)
 {
     portENTER_CRITICAL(&s_lock);
+    bool start = command < 0 ? s_state == REC_IDLE : command != 0;
     TaskHandle_t task = s_task;
     bool accepted = false;
     if (task) {
@@ -483,6 +484,16 @@ void recorder_request(bool start)
                  start ? "RECORD" : "STOP");
     }
     if (start && !task) ESP_LOGW(TAG, "recorder not ready");
+}
+
+void recorder_request(bool start)
+{
+    recorder_command(start ? 1 : 0);
+}
+
+void recorder_toggle(void)
+{
+    recorder_command(-1);
 }
 
 void recorder_submit(const uint8_t *rgb565, size_t len, size_t stride)
