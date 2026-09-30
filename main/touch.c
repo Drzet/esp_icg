@@ -7,6 +7,7 @@
 #include "esp_log.h"
 
 #include "app_config.h"
+#include "shared_spi.h"
 
 #define XPT2046_CMD_X 0xD0
 #define XPT2046_CMD_Y 0x90
@@ -71,17 +72,6 @@ esp_err_t touch_init(void)
     esp_err_t ret = gpio_config(&irq_cfg);
     if (ret != ESP_OK) return ret;
 
-    spi_bus_config_t bus_cfg = {
-        .sclk_io_num = ICG_TOUCH_PIN_SCLK,
-        .mosi_io_num = ICG_TOUCH_PIN_MOSI,
-        .miso_io_num = ICG_TOUCH_PIN_MISO,
-        .quadwp_io_num = -1,
-        .quadhd_io_num = -1,
-        .max_transfer_sz = 3,
-    };
-    ret = spi_bus_initialize(ICG_TOUCH_HOST, &bus_cfg, SPI_DMA_CH_AUTO);
-    if (ret != ESP_OK) return ret;
-
     spi_device_interface_config_t dev_cfg = {
         .clock_speed_hz = ICG_TOUCH_CLOCK_HZ,
         .mode = 0,
@@ -104,7 +94,10 @@ bool touch_read(touch_point_t *point)
     }
 
     uint16_t raw_x, raw_y;
-    if (!read_axis(XPT2046_CMD_X, &raw_x) || !read_axis(XPT2046_CMD_Y, &raw_y)) {
+    if (!shared_spi_touch_lock()) return false;
+    bool ok = read_axis(XPT2046_CMD_X, &raw_x) && read_axis(XPT2046_CMD_Y, &raw_y);
+    shared_spi_unlock();
+    if (!ok) {
         return false;
     }
 
@@ -123,4 +116,9 @@ bool touch_read(touch_point_t *point)
                         ICG_LCD_HEIGHT - 1, ICG_TOUCH_INVERT_Y);
 #endif
     return true;
+}
+
+bool touch_is_pressed(void)
+{
+    return s_touch && gpio_get_level(ICG_TOUCH_PIN_IRQ) == 0;
 }

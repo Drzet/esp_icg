@@ -1,4 +1,6 @@
 #include "display.h"
+#include <string.h>
+#include "recorder.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -99,7 +101,7 @@ esp_err_t display_init(void)
     ESP_RETURN_ON_ERROR(esp_lcd_panel_invert_color(s_panel, false), TAG, "normal colors");
     ESP_RETURN_ON_ERROR(esp_lcd_panel_disp_on_off(s_panel, true), TAG, "display on");
 
-    s_line = heap_caps_malloc(ICG_LCD_WIDTH * sizeof(uint16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    s_line = heap_caps_malloc(LCD_BATCH_PIXELS * sizeof(uint16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (!s_line) return ESP_ERR_NO_MEM;
 
     return clear_screen();
@@ -109,10 +111,25 @@ esp_err_t display_draw_preview(const uint16_t *rgb565_frame)
 {
     if (!rgb565_frame) return ESP_ERR_INVALID_ARG;
 
+    const bool recording = recorder_is_recording();
+    const int dot_x = ICG_LCD_WIDTH - 12, dot_y = 12, radius = 5;
     for (int y = 0; y < ICG_PREVIEW_HEIGHT; y += LCD_BATCH_LINES) {
         int y1 = y + LCD_BATCH_LINES;
         if (y1 > ICG_PREVIEW_HEIGHT) y1 = ICG_PREVIEW_HEIGHT;
         const uint16_t *block = rgb565_frame + (size_t)y * ICG_LCD_WIDTH;
+        if (recording && y <= dot_y + radius && y1 > dot_y - radius) {
+            /* Overlay only on the LCD staging buffer; never change camera or
+             * preview buffers used by other tasks. */
+            memcpy(s_line, block, (size_t)(y1 - y) * ICG_LCD_WIDTH * sizeof(uint16_t));
+            for (int py = y; py < y1; ++py) {
+                for (int px = dot_x - radius; px <= dot_x + radius; ++px) {
+                    int dx = px - dot_x, dy = py - dot_y;
+                    if (dx * dx + dy * dy <= radius * radius)
+                        s_line[(py - y) * ICG_LCD_WIDTH + px] = 0xf800;
+                }
+            }
+            block = s_line;
+        }
         esp_err_t ret = draw_block_sync(y, y1, block);
         if (ret != ESP_OK) return ret;
     }
