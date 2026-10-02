@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - feature/usb-phone-preview
       - investigate/6.0.3-af-enabled
   pull_request:
   workflow_dispatch:
@@ -31,11 +32,15 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: esp_icg-imx708-esp32p4
+          name: esp_icg-usb-phone-esp32p4
           path: |
             build/*.bin
             build/*.elf
             build/*.map
+            build/flash_args
+            build/flasher_args.json
+            sdkconfig
+            dependencies.lock
             build/bootloader/*.bin
             build/partition_table/*.bin
           if-no-files-found: error
