@@ -52,6 +52,120 @@ static p4d_camera_state_t s_camera = {
     .fd = -1,
 };
 
+typedef struct {
+    bool exposure_pending;
+    int32_t exposure_value;
+    bool gain_pending;
+    int32_t gain_value;
+} p4d_camera_control_request_t;
+
+static portMUX_TYPE s_control_lock = portMUX_INITIALIZER_UNLOCKED;
+static p4d_camera_control_request_t s_control_request;
+static p4d_camera_control_info_t s_control_info;
+static bool s_control_info_valid;
+
+static esp_err_t query_controls(int fd)
+{
+    struct v4l2_query_ext_ctrl exposure = {
+        .id = V4L2_CID_EXPOSURE_ABSOLUTE,
+    };
+    if (ioctl(fd, VIDIOC_QUERY_EXT_CTRL, &exposure) != 0) {
+        ESP_LOGE(TAG, "VIDIOC_QUERY_EXT_CTRL exposure failed: %d", errno);
+        return ESP_FAIL;
+    }
+
+    struct v4l2_query_ext_ctrl gain = {
+        .id = V4L2_CID_GAIN,
+    };
+    if (ioctl(fd, VIDIOC_QUERY_EXT_CTRL, &gain) != 0) {
+        ESP_LOGE(TAG, "VIDIOC_QUERY_EXT_CTRL gain failed: %d", errno);
+        return ESP_FAIL;
+    }
+
+    s_control_info.exposure_min = exposure.minimum;
+    s_control_info.exposure_max = exposure.maximum;
+    s_control_info.exposure_step = exposure.step ? exposure.step : 1;
+    s_control_info.exposure_default = exposure.default_value;
+    s_control_info.gain_min = gain.minimum;
+    s_control_info.gain_max = gain.maximum;
+    s_control_info.gain_default = gain.default_value;
+    s_control_info_valid = true;
+
+    ESP_LOGI(TAG, "controls: exposure=%ld..%ld step=%ld default=%ld (100 us), gain=%ld..%ld default=%ld",
+             (long)s_control_info.exposure_min, (long)s_control_info.exposure_max,
+             (long)s_control_info.exposure_step, (long)s_control_info.exposure_default,
+             (long)s_control_info.gain_min, (long)s_control_info.gain_max,
+             (long)s_control_info.gain_default);
+    return ESP_OK;
+}
+
+static void apply_control_requests(int fd)
+{
+    p4d_camera_control_request_t req;
+
+    portENTER_CRITICAL(&s_control_lock);
+    req = s_control_request;
+    memset(&s_control_request, 0, sizeof(s_control_request));
+    portEXIT_CRITICAL(&s_control_lock);
+
+    if (req.exposure_pending) {
+        struct v4l2_ext_control ctrl = {
+            .id = V4L2_CID_EXPOSURE_ABSOLUTE,
+            .value = req.exposure_value,
+        };
+        struct v4l2_ext_controls ctrls = {
+            .ctrl_class = V4L2_CID_CAMERA_CLASS,
+            .count = 1,
+            .controls = &ctrl,
+        };
+        if (ioctl(fd, VIDIOC_S_EXT_CTRLS, &ctrls) != 0) {
+            ESP_LOGE(TAG, "setting exposure=%ld failed: %d",
+                     (long)req.exposure_value, errno);
+        }
+    }
+
+    if (req.gain_pending) {
+        struct v4l2_ext_control ctrl = {
+            .id = V4L2_CID_GAIN,
+            .value = req.gain_value,
+        };
+        struct v4l2_ext_controls ctrls = {
+            .ctrl_class = V4L2_CTRL_CLASS_USER,
+            .count = 1,
+            .controls = &ctrl,
+        };
+        if (ioctl(fd, VIDIOC_S_EXT_CTRLS, &ctrls) != 0) {
+            ESP_LOGE(TAG, "setting gain=%ld failed: %d",
+                     (long)req.gain_value, errno);
+        }
+    }
+}
+
+esp_err_t p4d_camera_get_control_info(p4d_camera_control_info_t *info)
+{
+    if (!info || !s_control_info_valid) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    *info = s_control_info;
+    return ESP_OK;
+}
+
+void p4d_camera_request_exposure(int32_t value)
+{
+    portENTER_CRITICAL(&s_control_lock);
+    s_control_request.exposure_value = value;
+    s_control_request.exposure_pending = true;
+    portEXIT_CRITICAL(&s_control_lock);
+}
+
+void p4d_camera_request_gain(int32_t value)
+{
+    portENTER_CRITICAL(&s_control_lock);
+    s_control_request.gain_value = value;
+    s_control_request.gain_pending = true;
+    portEXIT_CRITICAL(&s_control_lock);
+}
+
 static esp_err_t configure_sensor(int fd)
 {
     esp_cam_sensor_format_t *sensor = &s_camera.sensor_format;
@@ -169,6 +283,9 @@ static void camera_stream_task(void *arg)
                 ESP_LOGE(TAG, "VIDIOC_QBUF failed: %d", errno);
                 break;
             }
+
+            apply_control_requests(fd);
+
             /* A continuously populated capture queue need not block DQBUF.
              * Let the idle task run periodically, after returning the buffer.
              * taskYIELD alone would not allow a lower-priority task to run. */
@@ -225,6 +342,9 @@ esp_err_t p4d_camera_start(p4d_camera_frame_cb_t cb, void *user_ctx)
     s_camera.fd = fd;
 
     if (configure_sensor(fd) != ESP_OK) {
+        goto err;
+    }
+    if (query_controls(fd) != ESP_OK) {
         goto err;
     }
 
