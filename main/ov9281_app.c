@@ -23,10 +23,10 @@
 #include "shared_spi.h"
 #include "touch.h"
 
-#define CAMERA_WIDTH 640
-#define CAMERA_HEIGHT 400
+#define CAMERA_WIDTH 1280
+#define CAMERA_HEIGHT 720
 #define CAMERA_BUFFER_COUNT 3
-#define PREVIEW_CROP_WIDTH 600
+#define PREVIEW_CROP_WIDTH 1080
 #define PREVIEW_CROP_X ((CAMERA_WIDTH - PREVIEW_CROP_WIDTH) / 2)
 #define PREVIEW_BUFFER_COUNT 3
 #define PREVIEW_BUFFER_PIXELS (ICG_LCD_WIDTH * ICG_PREVIEW_HEIGHT)
@@ -112,15 +112,15 @@ static void preview_publish(int index)
     xTaskNotifyGive(s_display_task);
 }
 
-/* 600x400 centre crop -> 480x320. Both axes are exactly 4/5. */
+/* 1080x720 centre crop -> 480x320. Both axes scale by 4/9. */
 static void make_preview(const uint8_t *gray, uint16_t *out)
 {
     for (uint32_t y = 0; y < ICG_PREVIEW_HEIGHT; ++y) {
-        const uint32_t sy = (y * 5U) / 4U;
+        const uint32_t sy = (y * 9U) / 4U;
         const uint8_t *src = gray + (size_t)sy * CAMERA_WIDTH + PREVIEW_CROP_X;
         uint16_t *dst = out + (size_t)y * ICG_LCD_WIDTH;
         for (uint32_t x = 0; x < ICG_LCD_WIDTH; ++x) {
-            const uint32_t sx = (x * 5U) / 4U;
+            const uint32_t sx = (x * 9U) / 4U;
             dst[x] = gray_to_rgb565(src[sx]);
         }
     }
@@ -216,7 +216,7 @@ static esp_err_t run_camera(void)
         .fmt.pix.pixelformat = V4L2_PIX_FMT_SBGGR8,
     };
     if (ioctl(fd, VIDIOC_S_FMT, &fmt) != 0) {
-        ESP_LOGE(TAG, "VIDIOC_S_FMT RAW8 640x400 failed errno=%d", errno);
+        ESP_LOGE(TAG, "VIDIOC_S_FMT RAW8 1280x720 failed errno=%d", errno);
         close(fd);
         return ESP_FAIL;
     }
@@ -247,7 +247,7 @@ static esp_err_t run_camera(void)
     const size_t gray_stride = fmt.fmt.pix.bytesperline ?
                                fmt.fmt.pix.bytesperline : CAMERA_WIDTH;
     if (gray_stride != CAMERA_WIDTH) {
-        ESP_LOGE(TAG, "RAW8 stride=%u is not tightly packed; expected 640",
+        ESP_LOGE(TAG, "RAW8 stride=%u is not tightly packed; expected 1280",
                  (unsigned)gray_stride);
         close(fd);
         return ESP_ERR_NOT_SUPPORTED;
@@ -306,7 +306,7 @@ static esp_err_t run_camera(void)
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "OV9281 live: RAW8 640x400; preview crop 600x400 -> 480x320");
+    ESP_LOGI(TAG, "OV9281 live: RAW8 1280x720; preview crop 1080x720 -> 480x320");
 
     while (true) {
         struct v4l2_buffer b = {
