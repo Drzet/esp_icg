@@ -338,8 +338,8 @@ static void recorder_task(void *arg)
     (void)arg;
     const jpeg_encode_cfg_t cfg = {
         .width = s_width, .height = s_height,
-        .src_type = JPEG_ENCODE_IN_FORMAT_RGB565,
-        .sub_sample = JPEG_DOWN_SAMPLING_YUV422,
+        .src_type = JPEG_ENCODE_IN_FORMAT_GRAY,
+        .sub_sample = JPEG_DOWN_SAMPLING_GRAY,
         .image_quality = ICG_RECORD_QUALITY,
     };
     while (true) {
@@ -402,7 +402,7 @@ esp_err_t recorder_init(uint32_t width, uint32_t height)
     ESP_LOGI(TAG, "recorder initialization starting");
     /* This firmware's tested capture mode. Reject unexpected geometry instead
      * of silently overflowing buffers or producing a malformed JPEG. */
-    if (width != 1920 || height != 1080) return ESP_ERR_NOT_SUPPORTED;
+    if (width != 1280 || height != 720) return ESP_ERR_NOT_SUPPORTED;
     s_width = width; s_height = height;
     jpeg_encode_memory_alloc_cfg_t out = { .buffer_direction = JPEG_ENC_ALLOC_OUTPUT_BUFFER };
     size_t bytes = (size_t)width * height * 2;
@@ -498,7 +498,7 @@ void recorder_toggle(void)
 
 void recorder_submit(const uint8_t *rgb565, size_t len, size_t stride)
 {
-    size_t row_bytes = (size_t)s_width * 2;
+    size_t row_bytes = (size_t)s_width;
     if (!stride) stride = row_bytes;
     if (!rgb565 || stride != row_bytes || len < row_bytes * s_height) return;
 
