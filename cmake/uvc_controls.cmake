@@ -1,8 +1,8 @@
 # esp_video 2.4.1 has no manual-ISP ownership callback. Build a generated copy
 # with a narrow hook around its existing configuration function. Managed source
 # files remain untouched. Fail configuration if the expected function changes.
-idf_component_get_property(video_dir esp_video COMPONENT_DIR)
-idf_component_get_property(video_lib esp_video COMPONENT_LIB)
+idf_component_get_property(video_dir espressif__esp_video COMPONENT_DIR)
+idf_component_get_property(video_lib espressif__esp_video COMPONENT_LIB)
 set(pipeline_source "${video_dir}/src/esp_video_isp_pipeline.c")
 file(READ "${pipeline_source}" pipeline_text)
 set(hook_begin "static void config_isp_and_camera(esp_video_isp_t *isp, esp_ipa_metadata_t *metadata)\n{\n")

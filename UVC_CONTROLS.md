@@ -57,4 +57,5 @@ error counters while streaming. Phone compatibility and control effects require
 this hardware test; a successful compile does not establish them.
 
 Host-side checks: `python tests/uvc_controls_test.py` and
-`python tests/uvc_ownership_test.py`.
+`python tests/uvc_ownership_test.py`, plus `python tests/camera_controls_test.py`.
+CI also checks the linked ELF for the descriptor/control wrappers and ISP hook.
