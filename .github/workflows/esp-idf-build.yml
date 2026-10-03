@@ -19,6 +19,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Check USB control and frame ownership contracts
+        shell: bash
+        run: |
+          python tests/uvc_controls_test.py
+          python tests/uvc_ownership_test.py
+
       - name: Build ESP32-P4 firmware
         shell: bash
         run: |

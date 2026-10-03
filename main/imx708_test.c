@@ -13,6 +13,7 @@
 #include "linux/videodev2.h"
 #include "isp_diag.h"
 #include "uvc_stream.h"
+#include "camera_controls.h"
 
 #if CONFIG_ESP_VIDEO_ISP_PIPELINE_CONTROL_CAMERA_MOTOR
 #error "USB prototype uses fixed manual focus; disable IPA motor control"
@@ -136,6 +137,8 @@ static esp_err_t run_camera(int fd)
         ESP_LOGE(TAG, "initial focus failed: errno=%d", errno);
         goto cleanup;
     }
+    result = camera_controls_init(fd);
+    if (result != ESP_OK) goto cleanup;
     result = uvc_stream_init();
     if (result != ESP_OK) goto cleanup;
     ESP_LOGI(TAG, "USB ready: 1080p q80, nominal 30 cm focus, automatic exposure/gain");

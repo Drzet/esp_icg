@@ -11,6 +11,7 @@ idf_build_set_property(ESP_IPA_JSON_CONFIG_FILE_PATH "${imx708_ipa_json}" APPEND
 idf_build_set_property(IMX708_IPA_JSON_RESOLVED "${imx708_ipa_json}")
 
 project(esp_icg)
+include(cmake/uvc_controls.cmake)
 
 # ESP32-P4 rev1 cannot execute the Zba instructions in esp_ipa 2.3.0's
 # IDF 6.0+ prebuilt archive. For this experiment only, keep esp_ipa 2.3.0
