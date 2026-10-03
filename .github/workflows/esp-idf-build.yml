@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - investigate/6.0.3-af-enabled
+      - device/ov9281-spi-sd
   pull_request:
   workflow_dispatch:
 
@@ -31,7 +32,7 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: esp_icg-imx708-esp32p4
+          name: esp_icg-ov9281-spi-sd-esp32p4
           path: |
             build/*.bin
             build/*.elf
