@@ -7,6 +7,9 @@ idf_component_register(
 
 # TinyUSB 0.19 has no entity-control callback. Keep VS negotiation unchanged.
 target_link_libraries(${COMPONENT_LIB} INTERFACE
+    "-Wl,-u,__wrap_videod_control_xfer_cb"
+    "-Wl,-u,__wrap_tud_descriptor_configuration_cb"
+    "-Wl,-u,__wrap_tud_descriptor_device_cb"
     "-Wl,--wrap=videod_control_xfer_cb"
     "-Wl,--wrap=tud_descriptor_configuration_cb"
     "-Wl,--wrap=tud_descriptor_device_cb")
