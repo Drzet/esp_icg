@@ -25,6 +25,15 @@
 #define BOARD_I2C_SCL 8
 #define DISPLAY_TASK_STACK 4096
 #define RECORD_TASK_STACK 2048
+#define TOUCH_TASK_STACK 3072
+#define TOUCH_TASK_PRIORITY (tskIDLE_PRIORITY + 1)
+
+/* Two horizontal 156-pixel control bands with an 8-pixel dead gap. */
+#define TOUCH_ZONE_HEIGHT 156
+#define TOUCH_ZONE_GAP 8
+
+/* Preserve the old slider behaviour: rightmost 10% is a hard maximum plateau. */
+#define CONTROL_MAX_PLATEAU_X ((ICG_LCD_WIDTH * 90) / 100)
 
 static const char *TAG = "ov9281_app";
 
@@ -37,6 +46,8 @@ static volatile uint32_t s_capture_frames;
 static volatile uint32_t s_display_frames;
 static volatile uint32_t s_skipped_previews;
 static bool s_recorder_ready;
+static bool s_touch_available;
+static p4d_camera_control_info_t s_control_info;
 
 static esp_err_t shared_i2c_init(i2c_master_bus_handle_t *ret_bus)
 {
@@ -217,6 +228,101 @@ static esp_err_t init_record_button(void)
                : ESP_ERR_NO_MEM;
 }
 
+static int touch_zone_from_y(int y)
+{
+    if (y >= 0 && y < TOUCH_ZONE_HEIGHT) return 0;
+
+    const int lower = TOUCH_ZONE_HEIGHT + TOUCH_ZONE_GAP;
+    if (y >= lower && y < lower + TOUCH_ZONE_HEIGHT) return 1;
+
+    return -1;
+}
+
+static int32_t control_value_from_x(int x, int32_t minimum, int32_t maximum, int32_t step)
+{
+    if (x < 0) x = 0;
+    if (x >= ICG_LCD_WIDTH) x = ICG_LCD_WIDTH - 1;
+    if (step < 1) step = 1;
+    if (maximum <= minimum) return minimum;
+
+    if (x >= CONTROL_MAX_PLATEAU_X) return maximum;
+
+    int32_t count = (maximum - minimum) / step + 1;
+    if (count <= 1) return minimum;
+    if (count == 2) return minimum;
+
+    const int32_t non_max_count = count - 1;
+    int32_t index =
+        (int32_t)(((int64_t)x * (non_max_count - 1) +
+                   (CONTROL_MAX_PLATEAU_X - 1) / 2) /
+                  (CONTROL_MAX_PLATEAU_X - 1));
+    int32_t value = minimum + index * step;
+    return value > maximum ? maximum : value;
+}
+
+static void touch_task(void *arg)
+{
+    (void)arg;
+
+    int active_zone = -1;
+    int32_t active_value = INT32_MIN;
+    unsigned release_samples = 0;
+
+    while (true) {
+        touch_point_t p;
+        if (!touch_read(&p)) {
+            if (!touch_is_pressed() && ++release_samples >= 3) {
+                active_zone = -1;
+                active_value = INT32_MIN;
+            }
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+
+        release_samples = 0;
+        int zone = touch_zone_from_y(p.y);
+        if (zone < 0) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+
+        int32_t value;
+        if (zone == 0) {
+            value = control_value_from_x(
+                p.x,
+                s_control_info.exposure_min,
+                s_control_info.exposure_max,
+                s_control_info.exposure_step);
+        } else {
+            value = control_value_from_x(
+                p.x,
+                s_control_info.gain_min,
+                s_control_info.gain_max,
+                1);
+        }
+
+        if (zone == active_zone && value == active_value) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+        active_zone = zone;
+        active_value = value;
+
+        if (zone == 0) {
+            p4d_camera_request_exposure(value);
+            ESP_LOGI(TAG, "touch EXP=%ld (%.1f ms) raw=%u,%u xy=%d,%d",
+                     (long)value, (double)value / 10.0,
+                     p.raw_x, p.raw_y, p.x, p.y);
+        } else {
+            p4d_camera_request_gain(value);
+            ESP_LOGI(TAG, "touch GAIN idx=%ld raw=%u,%u xy=%d,%d",
+                     (long)value, p.raw_x, p.raw_y, p.x, p.y);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
 void app_main(void)
 {
     ESP_LOGI(TAG, "OV9281 1280x720 RAW8 -> SPI preview + grayscale JPEG/AVI");
@@ -225,7 +331,8 @@ void app_main(void)
     ESP_ERROR_CHECK(shared_spi_init());
 
     esp_err_t touch_ret = touch_init();
-    if (touch_ret != ESP_OK) {
+    s_touch_available = touch_ret == ESP_OK;
+    if (!s_touch_available) {
         ESP_LOGW(TAG, "touch unavailable: %s", esp_err_to_name(touch_ret));
     }
 
@@ -257,6 +364,18 @@ void app_main(void)
     ESP_ERROR_CHECK(shared_i2c_init(&i2c_bus));
     ESP_ERROR_CHECK(p4d_camera_init(i2c_bus));
     ESP_ERROR_CHECK(p4d_camera_start(camera_frame, NULL));
+
+    if (s_touch_available) {
+        ESP_ERROR_CHECK(p4d_camera_get_control_info(&s_control_info));
+        if (xTaskCreate(touch_task, "touch", TOUCH_TASK_STACK, NULL,
+                        TOUCH_TASK_PRIORITY, NULL) != pdPASS) {
+            ESP_LOGE(TAG, "touch task creation failed");
+        } else {
+            ESP_LOGI(TAG,
+                     "touch controls: top=exposure bottom=gain, %d px dead gap",
+                     TOUCH_ZONE_GAP);
+        }
+    }
 
     ESP_LOGI(TAG, "initialization complete");
 }
