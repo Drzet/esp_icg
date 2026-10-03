@@ -1,6 +1,6 @@
 dependencies:
   idf:
-    version: ">=6.0.2"
+    version: ">=6.0.3"
   atanisoft/esp_lcd_ili9488: "==1.1.1"
   espressif/esp_video: "==2.0.1"
   espressif/esp_cam_sensor: "==2.0.1"
