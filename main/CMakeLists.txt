@@ -1,18 +1,17 @@
 idf_component_register(
     SRCS
-        "imx708_test.c"
+        "ov9281_app.c"
         "display.c"
         "touch.c"
         "shared_spi.c"
         "recorder.c"
         "avi_writer.c"
-        "isp_diag.c"
     INCLUDE_DIRS "."
     REQUIRES
-        esp_video
-        esp_cam_sensor_imx
+        espressif__esp_video
+        espressif__esp_cam_sensor
+        esp_driver_i2c
         esp_driver_gpio
-        esp_driver_ppa
         esp_driver_spi
         esp_driver_jpeg
         fatfs
@@ -20,3 +19,6 @@ idf_component_register(
         esp_timer
         esp_lcd
 )
+
+# esp_cam_sensor 2.0.1 uses link-time sensor registration.
+target_link_libraries(${COMPONENT_LIB} INTERFACE "-u ov9281_detect")
