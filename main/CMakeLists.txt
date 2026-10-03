@@ -1,6 +1,6 @@
 # Keep the proven SD/AVI recorder implementation intact, but compile an
 # OV9281-specific generated copy with only its input contract changed:
-# 1920x1080 RGB565/YUV422 -> 640x400 native GRAY/GRAY.
+# 1920x1080 RGB565/YUV422 -> 1280x720 native GRAY/GRAY.
 file(READ "${CMAKE_CURRENT_LIST_DIR}/recorder.c" OV_RECORDER_SOURCE)
 string(REPLACE
     ".src_type = JPEG_ENCODE_IN_FORMAT_RGB565,"
@@ -12,7 +12,7 @@ string(REPLACE
     OV_RECORDER_SOURCE "${OV_RECORDER_SOURCE}")
 string(REPLACE
     "if (width != 1920 || height != 1080) return ESP_ERR_NOT_SUPPORTED;"
-    "if (width != 640 || height != 400) return ESP_ERR_NOT_SUPPORTED;"
+    "if (width != 1280 || height != 720) return ESP_ERR_NOT_SUPPORTED;"
     OV_RECORDER_SOURCE "${OV_RECORDER_SOURCE}")
 string(REPLACE
     "size_t row_bytes = (size_t)s_width * 2;"
