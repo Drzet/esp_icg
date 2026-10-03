@@ -20,6 +20,16 @@ typedef void (*p4d_camera_frame_cb_t)(
     uint32_t height,
     void *user_ctx);
 
+typedef struct {
+    int32_t exposure_min;
+    int32_t exposure_max;
+    int32_t exposure_step;
+    int32_t exposure_default;
+    int32_t gain_min;
+    int32_t gain_max;
+    int32_t gain_default;
+} p4d_camera_control_info_t;
+
 /**
  * Initialize the WT9932P4-TINY MIPI-CSI path through esp_video using the
  * caller's shared I2C bus. The board exposes no camera reset or PWDN GPIO.
@@ -28,6 +38,13 @@ esp_err_t p4d_camera_init(i2c_master_bus_handle_t i2c_bus);
 
 /** Start OV9281 1280x720 RAW8 capture using the Wireless-Tag BSP CSI flow. */
 esp_err_t p4d_camera_start(p4d_camera_frame_cb_t cb, void *user_ctx);
+
+/** Query the exposure/gain ranges discovered from the OV9281 V4L2 controls. */
+esp_err_t p4d_camera_get_control_info(p4d_camera_control_info_t *info);
+
+/** Queue sensor controls; camera task applies them immediately after QBUF. */
+void p4d_camera_request_exposure(int32_t value);
+void p4d_camera_request_gain(int32_t value);
 
 #ifdef __cplusplus
 }
