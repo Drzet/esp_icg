@@ -360,6 +360,28 @@ esp_err_t p4d_camera_start(p4d_camera_frame_cb_t cb, void *user_ctx)
         goto err;
     }
 
+    struct v4l2_streamparm parm = {
+        .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+    };
+    parm.parm.capture.capability = V4L2_CAP_TIMEPERFRAME;
+    parm.parm.capture.timeperframe.numerator = 1;
+    parm.parm.capture.timeperframe.denominator = 20;
+    if (ioctl(fd, VIDIOC_S_PARM, &parm) != 0) {
+        ESP_LOGW(TAG, "VIDIOC_S_PARM 20 fps failed: %d", errno);
+    } else {
+        struct v4l2_streamparm actual = {
+            .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+        };
+        if (ioctl(fd, VIDIOC_G_PARM, &actual) == 0 &&
+            actual.parm.capture.timeperframe.numerator != 0) {
+            ESP_LOGI(TAG, "capture interval: %u/%u s (%.2f fps)",
+                     actual.parm.capture.timeperframe.numerator,
+                     actual.parm.capture.timeperframe.denominator,
+                     (double)actual.parm.capture.timeperframe.denominator /
+                     actual.parm.capture.timeperframe.numerator);
+        }
+    }
+
     struct v4l2_requestbuffers req = {
         .count = CAMERA_BUFFER_COUNT,
         .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
