@@ -31,7 +31,7 @@ static const char *TAG = "p4d_camera";
 #define CAMERA_HEIGHT            P4D_CAMERA_HEIGHT
 #define CAMERA_BUFFER_COUNT      3
 #define CAMERA_TASK_STACK_SIZE   8192
-#define CAMERA_TASK_PRIORITY     5
+#define CAMERA_TASK_PRIORITY     (tskIDLE_PRIORITY + 1)
 #define CAMERA_LANE_BIT_RATE_HZ   800000000
 
 typedef struct {
