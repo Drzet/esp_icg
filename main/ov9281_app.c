@@ -26,7 +26,7 @@
 #define DISPLAY_TASK_STACK 4096
 #define RECORD_TASK_STACK 2048
 #define TOUCH_TASK_STACK 3072
-#define TOUCH_TASK_PRIORITY 6
+#define TOUCH_TASK_PRIORITY (tskIDLE_PRIORITY + 1)
 
 /* Two horizontal 156-pixel control bands with an 8-pixel dead gap. */
 #define TOUCH_ZONE_HEIGHT 156
