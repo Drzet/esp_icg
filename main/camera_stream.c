@@ -365,9 +365,9 @@ esp_err_t p4d_camera_start(p4d_camera_frame_cb_t cb, void *user_ctx)
     };
     parm.parm.capture.capability = V4L2_CAP_TIMEPERFRAME;
     parm.parm.capture.timeperframe.numerator = 1;
-    parm.parm.capture.timeperframe.denominator = 20;
+    parm.parm.capture.timeperframe.denominator = 25;
     if (ioctl(fd, VIDIOC_S_PARM, &parm) != 0) {
-        ESP_LOGW(TAG, "VIDIOC_S_PARM 20 fps failed: %d", errno);
+        ESP_LOGW(TAG, "VIDIOC_S_PARM 25 fps failed: %d", errno);
     } else {
         struct v4l2_streamparm actual = {
             .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
