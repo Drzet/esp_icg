@@ -99,6 +99,27 @@ static esp_err_t query_controls(int fd)
     return ESP_OK;
 }
 
+static esp_err_t set_sensor_orientation(int fd)
+{
+    struct v4l2_ext_control ctrl[2] = {
+        { .id = V4L2_CID_HFLIP, .value = 1 },
+        { .id = V4L2_CID_VFLIP, .value = 1 },
+    };
+    struct v4l2_ext_controls ctrls = {
+        .ctrl_class = V4L2_CTRL_CLASS_USER,
+        .count = 2,
+        .controls = ctrl,
+    };
+
+    if (ioctl(fd, VIDIOC_S_EXT_CTRLS, &ctrls) != 0) {
+        ESP_LOGE(TAG, "setting 180-degree sensor orientation failed: %d", errno);
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "sensor orientation: HFLIP=1 VFLIP=1 (180 degrees)");
+    return ESP_OK;
+}
+
 static void apply_control_requests(int fd)
 {
     p4d_camera_control_request_t req;
@@ -345,6 +366,9 @@ esp_err_t p4d_camera_start(p4d_camera_frame_cb_t cb, void *user_ctx)
         goto err;
     }
     if (query_controls(fd) != ESP_OK) {
+        goto err;
+    }
+    if (set_sensor_orientation(fd) != ESP_OK) {
         goto err;
     }
 
