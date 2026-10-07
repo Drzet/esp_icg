@@ -27,6 +27,7 @@
 #define RECORD_TASK_STACK 2048
 #define TOUCH_TASK_STACK 3072
 #define TOUCH_TASK_PRIORITY (tskIDLE_PRIORITY + 1)
+#define FAN_GPIO 39
 
 /* Two horizontal 156-pixel control bands with an 8-pixel dead gap. */
 #define TOUCH_ZONE_HEIGHT 156
@@ -376,6 +377,17 @@ void app_main(void)
                      TOUCH_ZONE_GAP);
         }
     }
+
+    const gpio_config_t fan_cfg = {
+        .pin_bit_mask = 1ULL << FAN_GPIO,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&fan_cfg));
+    ESP_ERROR_CHECK(gpio_set_level(FAN_GPIO, 1));
+    ESP_LOGI(TAG, "fan on: GPIO%d high", FAN_GPIO);
 
     ESP_LOGI(TAG, "initialization complete");
 }
