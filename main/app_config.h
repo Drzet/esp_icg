@@ -41,7 +41,7 @@
 #define ICG_SD_PIN_CS        23
 
 /* WT9932P4-TINY onboard socket: native SDMMC slot 0, LDO_VO4 supply.
- * Start at 20 MHz for the first hardware recording test. */
+ * 20 MHz recording passed; test High Speed mode at up to 40 MHz. */
 #define ICG_SD_SLOT          0
 #define ICG_SD_BUS_WIDTH     4
 #define ICG_SD_PIN_CLK       43
@@ -51,7 +51,7 @@
 #define ICG_SD_PIN_D2        41
 #define ICG_SD_PIN_D3        42
 #define ICG_SD_LDO_CHANNEL   4
-#define ICG_SD_CLOCK_KHZ     20000
+#define ICG_SD_CLOCK_KHZ     40000
 #define ICG_RECORD_QUALITY   90
 
 /* Momentary record/stop button: GPIO34 to GND, active low. */
