@@ -128,7 +128,8 @@ static bool mount_card(void)
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
     host.slot = ICG_SD_SLOT;
     host.max_freq_khz = ICG_SD_CLOCK_KHZ;
-    host.flags = SDMMC_HOST_FLAG_4BIT;
+    /* Preserve default lifecycle flags, including DEINIT_ARG.
+     * slot.width below selects the 4-bit bus. */
     host.pwr_ctrl_handle = s_sd_power;
     host.unaligned_multi_block_rw_max_chunk_size = DMA_BUFFER_BYTES / 512u;
     host.do_transaction = measured_sd_transaction;
