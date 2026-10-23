@@ -13,7 +13,7 @@
 #define ICG_LCD_HEIGHT     320
 #define ICG_PREVIEW_HEIGHT ICG_LCD_HEIGHT
 
-/* XPT2046 and SD share SPI3; each device has its own CS and clock. */
+/* XPT2046 uses SPI3; onboard SD uses the separate SDMMC peripheral. */
 #define ICG_TOUCH_HOST       SPI3_HOST
 #define ICG_TOUCH_PIN_CS     18
 #define ICG_TOUCH_PIN_IRQ    19
@@ -37,11 +37,21 @@
 #define ICG_TOUCH_INVERT_X   0
 #define ICG_TOUCH_INVERT_Y   1
 
-/* WT9932P4-TINY left header pin 8: free GPIO23 (3.3 V domain).
- * SD SCLK/MOSI/MISO connect to GPIO20/21/22 alongside the XPT2046.
- */
+/* Keep the old display SD socket deselected on the touch bus. */
 #define ICG_SD_PIN_CS        23
-#define ICG_SD_CLOCK_KHZ     40000
+
+/* WT9932P4-TINY onboard socket: native SDMMC slot 0, LDO_VO4 supply.
+ * Start at 20 MHz for the first hardware recording test. */
+#define ICG_SD_SLOT          0
+#define ICG_SD_BUS_WIDTH     4
+#define ICG_SD_PIN_CLK       43
+#define ICG_SD_PIN_CMD       44
+#define ICG_SD_PIN_D0        39
+#define ICG_SD_PIN_D1        40
+#define ICG_SD_PIN_D2        41
+#define ICG_SD_PIN_D3        42
+#define ICG_SD_LDO_CHANNEL   4
+#define ICG_SD_CLOCK_KHZ     20000
 #define ICG_RECORD_QUALITY   90
 
 /* Momentary record/stop button: GPIO34 to GND, active low. */

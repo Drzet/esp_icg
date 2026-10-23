@@ -30,45 +30,30 @@ not a measured optical calibration of this individual NoIR lens under 780 nm.
 `CONFIG_ESP_VIDEO_ISP_PIPELINE_CONTROL_CAMERA_MOTOR=n` remains mandatory; the
 motor controller remains enabled. No per-frame motor writes or focus slider.
 
-## SD wiring — external SPI socket/module
+## SD wiring — onboard WT9932P4-TINY socket
 
-| SD signal | GPIO | Connection |
-|---|---:|---|
-| SCK / CLK | 20 | Shared with XPT2046 SCLK |
-| MOSI / DI / CMD | 21 | Shared with XPT2046 MOSI |
-| MISO / DO / DAT0 | 22 | Shared with XPT2046 MISO |
-| CS / DAT3 | 23 | Dedicated SD CS, left header pin 8 |
-| GND | — | Common ground |
-| VCC | — | 3.3 V for a bare socket or 3.3 V module |
+The OV9281 recorder now uses native **4-bit SDMMC slot 0 at 20 MHz**, powered
+by **LDO_VO4 at 3.3 V**. The pin mapping follows the manufacturer's
+[WT9932P4-TINY BSP](https://github.com/Wireless-TAG-Maker/WT_BSP/blob/main/components/wt_bsp/boards/WT9932P4-TINY/board.c).
 
-GPIO23 is an exposed general-purpose 3.3 V pin according to the
-[WT9932P4-TINY manufacturer pin table](https://wiki.wireless-tag.com/docs/en/WT9932P4-TINY/board_features.html).
-These are actual defaults in `main/app_config.h`. Module supply requirements must
-be checked against its own circuit: this project does not identify the external
-SD module or assume a 5 V regulator/level-shifter design. All bus signals are
-3.3 V. Use a module that releases MISO when CS is high. Fit the SD pull-ups required
-by the socket/module (including CS and data lines); a bare socket needs external
-pull-ups. See [Espressif SD pull-up requirements](https://docs.espressif.com/projects/esp-idf/en/v6.0.3/esp32p4/api-reference/peripherals/sd_pullup_requirements.html).
+| SD signal | GPIO |
+|---|---:|
+| CLK | 43 |
+| CMD | 44 |
+| DAT0 | 39 |
+| DAT1 | 40 |
+| DAT2 | 41 |
+| DAT3 | 42 |
 
-Existing GPIO allocations audited from the working source:
+Fit the socket and its required board passives. Insert a FAT32 card before
+power-on. Mount failures never format the card. The display's old SD socket is
+unused; GPIO23 stays high to deselect it. Touch remains on SPI3 and LCD on SPI2.
+The fan remains on GPIO37. GPIO39 must be available for SD DAT0.
 
-| Function | GPIOs |
-|---|---|
-| Camera power / SCCB SDA / SCCB SCL | 0 / 7 / 8 |
-| LCD DC / reset / CS / MOSI / SCLK / MISO | 16 / 17 / 28 / 29 / 30 / 31 |
-| Touch CS / IRQ / SCLK / MOSI / MISO | 18 / 19 / 20 / 21 / 22 |
-| UART0 console (reserved) | 37 / 38 |
-| New SD CS | 23 |
-
-Both general SPI controllers were already occupied. SD shares **SPI3 with touch**
-at up to 40 MHz; touch stays at 2 MHz. An invalid response/CRC or unsupported
-initialization at that setting triggers one fresh 20 MHz attempt. Serial reports
-the actual configured SD clock separately from the requested maximum.
-LCD remains alone on SPI2. The SPI driver
-arbitrates transfers; a separate mutex excludes touch during SD mount/unmount.
-At boot a present card enters SPI mode before touch polling begins. Insert the
-card before power-on; stop and wait for the `STOP finalized` log before removal.
-Hot removal while recording is unsupported.
+Flash this branch, check the boot log for card information and `SD clock`, then
+record for 30 seconds and press STOP. Wait for `STOP finalized` before power-off.
+Check that the AVI opens and review final `SD I/O cumulative` error count,
+throughput and recording frame rate. Hardware operation is pending this test.
 
 ## Recording
 
@@ -87,10 +72,10 @@ Hot removal while recording is unsupported.
   capture never waits for storage. The raw frame is reusable once encoding and
   the compressed copy finish, without waiting for SD.
 - Recorder buffers use approximately 8.9 MB PSRAM, plus up to 3 MiB of JPEG
-  payloads. Actual throughput and 40 MHz signal integrity need board testing.
+  payloads. Actual throughput and SDMMC signal integrity need board testing.
 - A 512 KiB application buffer batches the AVI stream. Its contents pass through
   a 16 KiB aligned internal DMA buffer to POSIX `write()`, avoiding libc buffering
-  overhead and the SDSPI driver's per-sector PSRAM staging copy. FatFs metadata
+  overhead and per-sector PSRAM staging copies. FatFs metadata
   buffers also use internal RAM. Writes remain ordinary filesystem writes.
 - Before recording, reserve 64 MiB with the FatFs contiguous-allocation helper;
   no zero-filling. This is a rough 30-second reservation, not a recording limit.

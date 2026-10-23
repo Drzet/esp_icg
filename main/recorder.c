@@ -8,9 +8,9 @@
 #include <unistd.h>
 #include "app_config.h"
 #include "avi_writer.h"
-#include "shared_spi.h"
 #include "driver/jpeg_encode.h"
-#include "driver/sdspi_host.h"
+#include "driver/sdmmc_host.h"
+#include "sd_pwr_ctrl_by_on_chip_ldo.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -62,6 +62,7 @@ static jpeg_encoder_handle_t s_encoder;
 static avi_index_t *s_index;
 /* After initialization, only writer_task accesses card, AVI and files. */
 static sdmmc_card_t *s_card;
+static sd_pwr_ctrl_handle_t s_sd_power;
 static avi_writer_t s_avi = { .fd = -1 };
 static char s_path[48];
 /* Mount/init and recording I/O each have a single owner. No per-sector logging
@@ -79,7 +80,7 @@ static esp_err_t measured_sd_transaction(int slot, sdmmc_command_t *cmd)
     bool measure = s_measure_sd &&
         (cmd->opcode == MMC_WRITE_BLOCK_SINGLE || cmd->opcode == MMC_WRITE_BLOCK_MULTIPLE);
     int64_t begin = measure ? esp_timer_get_time() : 0;
-    esp_err_t ret = sdspi_host_do_transaction(slot, cmd);
+    esp_err_t ret = sdmmc_host_do_transaction(slot, cmd);
     if (measure) {
         int64_t elapsed = esp_timer_get_time() - begin;
         s_sd_stats.time_us += elapsed;
@@ -106,9 +107,7 @@ static void log_sd_stats(void)
 static void unmount_card(void)
 {
     if (s_card) {
-        shared_spi_mount_lock();
         esp_err_t err = esp_vfs_fat_sdcard_unmount(MOUNT_POINT, s_card);
-        shared_spi_unlock();
         if (err != ESP_OK) ESP_LOGE(TAG, "unmount failed: %s", esp_err_to_name(err));
         s_card = NULL;
     }
@@ -117,34 +116,38 @@ static void unmount_card(void)
 static bool mount_card(void)
 {
     if (s_card) return true;
-    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
-    host.slot = ICG_TOUCH_HOST;
+    if (!s_sd_power) {
+        const sd_pwr_ctrl_ldo_config_t power = { .ldo_chan_id = ICG_SD_LDO_CHANNEL };
+        esp_err_t ret = sd_pwr_ctrl_new_on_chip_ldo(&power, &s_sd_power);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "SD LDO%d initialization failed: %s",
+                     ICG_SD_LDO_CHANNEL, esp_err_to_name(ret));
+            return false;
+        }
+    }
+    sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+    host.slot = ICG_SD_SLOT;
     host.max_freq_khz = ICG_SD_CLOCK_KHZ;
+    host.flags = SDMMC_HOST_FLAG_4BIT;
+    host.pwr_ctrl_handle = s_sd_power;
     host.unaligned_multi_block_rw_max_chunk_size = DMA_BUFFER_BYTES / 512u;
     host.do_transaction = measured_sd_transaction;
-    sdspi_device_config_t slot = SDSPI_DEVICE_CONFIG_DEFAULT();
-    slot.host_id = ICG_TOUCH_HOST;
-    slot.gpio_cs = ICG_SD_PIN_CS;
+    sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
+    slot.width = ICG_SD_BUS_WIDTH;
+    slot.clk = ICG_SD_PIN_CLK;
+    slot.cmd = ICG_SD_PIN_CMD;
+    slot.d0 = ICG_SD_PIN_D0;
+    slot.d1 = ICG_SD_PIN_D1;
+    slot.d2 = ICG_SD_PIN_D2;
+    slot.d3 = ICG_SD_PIN_D3;
     esp_vfs_fat_sdmmc_mount_config_t mount = {
         .format_if_mount_failed = false,
         .max_files = 2,
         .allocation_unit_size = 32 * 1024,
     };
-    ESP_LOGI(TAG, "SD mount starting: requested maximum %d kHz", ICG_SD_CLOCK_KHZ);
-    shared_spi_mount_lock();
-    esp_err_t ret = esp_vfs_fat_sdspi_mount(MOUNT_POINT, &host, &slot, &mount, &s_card);
-    /* A failed mount cleans up its temporary card/device. Retry initialization
-     * from scratch, still excluding touch, when high-speed negotiation fails. */
-    if (host.max_freq_khz > SDMMC_FREQ_DEFAULT &&
-        (ret == ESP_ERR_INVALID_RESPONSE || ret == ESP_ERR_INVALID_CRC ||
-         ret == ESP_ERR_NOT_SUPPORTED)) {
-        ESP_LOGW(TAG, "SD init at max %d kHz failed (%s); retrying at %d kHz",
-                 host.max_freq_khz, esp_err_to_name(ret), SDMMC_FREQ_DEFAULT);
-        s_card = NULL;
-        host.max_freq_khz = SDMMC_FREQ_DEFAULT;
-        ret = esp_vfs_fat_sdspi_mount(MOUNT_POINT, &host, &slot, &mount, &s_card);
-    }
-    shared_spi_unlock();
+    ESP_LOGI(TAG, "SDMMC%d mount: %d-bit, max %d kHz, LDO%d (3.3 V)",
+             host.slot, slot.width, host.max_freq_khz, ICG_SD_LDO_CHANNEL);
+    esp_err_t ret = esp_vfs_fat_sdmmc_mount(MOUNT_POINT, &host, &slot, &mount, &s_card);
     if (ret != ESP_OK) {
         s_card = NULL;
         ESP_LOGE(TAG, "SD initialization/mount failed: %s; card was not formatted",
@@ -153,7 +156,7 @@ static bool mount_card(void)
     }
     sdmmc_card_print_info(stdout, s_card);
     int actual_khz = 0;
-    if (sdspi_host_get_real_freq(s_card->host.slot, &actual_khz) == ESP_OK) {
+    if (sdmmc_host_get_real_freq(s_card->host.slot, &actual_khz) == ESP_OK) {
         ESP_LOGI(TAG, "SD clock: actual=%d kHz requested_max=%d kHz; sector=%d bytes",
                  actual_khz, ICG_SD_CLOCK_KHZ, s_card->csd.sector_size);
     }
@@ -419,8 +422,7 @@ esp_err_t recorder_init(uint32_t width, uint32_t height)
     jpeg_encode_engine_cfg_t engine = { .timeout_ms = 1000 };
     ret = jpeg_new_encoder_engine(&engine, &s_encoder);
     if (ret != ESP_OK) goto fail;
-    /* Put a present card into SPI mode before the first XPT2046 transfer.
-     * A missing card is nonfatal; RECORD retries mounting it. */
+    /* Probe the onboard socket. A missing card is nonfatal; RECORD retries. */
     mount_card();
     s_jpeg_queue = xQueueCreate(JPEG_QUEUE_DEPTH, sizeof(jpeg_frame_t));
     if (!s_jpeg_queue) { ret = ESP_ERR_NO_MEM; goto fail; }
@@ -437,9 +439,10 @@ esp_err_t recorder_init(uint32_t width, uint32_t height)
     portENTER_CRITICAL(&s_lock);
     s_task = task;
     portEXIT_CRITICAL(&s_lock);
-    ESP_LOGI(TAG, "SD SPI3: SCLK=%d MOSI=%d MISO=%d CS=%d, requested max %d kHz",
-             ICG_TOUCH_PIN_SCLK, ICG_TOUCH_PIN_MOSI, ICG_TOUCH_PIN_MISO,
-             ICG_SD_PIN_CS, ICG_SD_CLOCK_KHZ);
+    ESP_LOGI(TAG, "SDMMC%d: CLK=%d CMD=%d D0=%d D1=%d D2=%d D3=%d, %d-bit, max %d kHz",
+             ICG_SD_SLOT, ICG_SD_PIN_CLK, ICG_SD_PIN_CMD, ICG_SD_PIN_D0,
+             ICG_SD_PIN_D1, ICG_SD_PIN_D2, ICG_SD_PIN_D3,
+             ICG_SD_BUS_WIDTH, ICG_SD_CLOCK_KHZ);
     return ESP_OK;
 fail:
     ESP_LOGE(TAG, "recorder initialization failed: %s; free internal=%u PSRAM=%u",
@@ -450,6 +453,10 @@ fail:
     if (s_jpeg_queue) { vQueueDelete(s_jpeg_queue); s_jpeg_queue = NULL; }
     if (s_encode_done) { vSemaphoreDelete(s_encode_done); s_encode_done = NULL; }
     unmount_card();
+    if (s_sd_power) {
+        sd_pwr_ctrl_del_on_chip_ldo(s_sd_power);
+        s_sd_power = NULL;
+    }
     if (s_encoder) { jpeg_del_encoder_engine(s_encoder); s_encoder = NULL; }
     free(s_jpeg); free(s_index); free(s_file_buffer); free(s_dma_buffer);
     s_jpeg = NULL; s_index = NULL; s_file_buffer = NULL; s_dma_buffer = NULL;
